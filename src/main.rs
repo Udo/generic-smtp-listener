@@ -514,7 +514,7 @@ fn collect_llm_parts(part: &MessagePart<'_>) -> Vec<KeptPart> {
         return kept;
     }
 
-    if is_attachment(&part.headers) {
+    if is_attachment_like(&part.headers, &media_type) {
         return vec![KeptPart {
             headers: minimal_attachment_headers(&part.headers),
             body: part.body.to_vec(),
@@ -649,10 +649,25 @@ fn trim_quotes(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-fn is_attachment(headers: &[(String, String)]) -> bool {
-    header_value(headers, "content-disposition")
-        .map(|value| value.to_ascii_lowercase().starts_with("attachment"))
+fn is_attachment_like(headers: &[(String, String)], media_type: &str) -> bool {
+    if header_value(headers, "content-disposition")
+        .map(|value| {
+            let lower = value.to_ascii_lowercase();
+            lower.starts_with("attachment") || lower.contains("filename=")
+        })
         .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if header_value(headers, "content-type")
+        .map(|value| value.to_ascii_lowercase().contains("name="))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    !media_type.starts_with("text/") && media_type != "message/rfc822"
 }
 
 fn minimal_attachment_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
@@ -919,7 +934,7 @@ mod tests {
 
     #[test]
     fn clean_message_keeps_attachments_with_minimal_headers() {
-        let message = b"Subject: Attachment\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=mix\r\n\r\n--mix\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n--mix\r\nContent-Type: application/pdf; name=doc.pdf\r\nContent-Disposition: attachment; filename=doc.pdf\r\nContent-Transfer-Encoding: base64\r\nX-Attachment-Tracker: remove-me\r\n\r\nJVBERi0xLjQK\r\n--mix--\r\n";
+        let message = b"Subject: Attachment\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=mix\r\n\r\n--mix\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n--mix\r\nContent-Type: application/pdf; name=doc.pdf\r\nContent-Disposition: attachment; filename=doc.pdf\r\nContent-Transfer-Encoding: base64\r\nX-Attachment-Tracker: remove-me\r\n\r\nJVBERi0xLjQK\r\n--mix\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nQUJDRA==\r\n--mix--\r\n";
 
         let cleaned = String::from_utf8(clean_message_for_llm(message)).unwrap();
 
@@ -929,6 +944,8 @@ mod tests {
         assert!(cleaned.contains("Content-Disposition: attachment; filename=doc.pdf"));
         assert!(cleaned.contains("Content-Transfer-Encoding: base64"));
         assert!(cleaned.contains("JVBERi0xLjQK"));
+        assert!(cleaned.contains("Content-Type: application/octet-stream"));
+        assert!(cleaned.contains("QUJDRA=="));
         assert!(!cleaned.contains("X-Attachment-Tracker"));
     }
 

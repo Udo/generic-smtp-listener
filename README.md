@@ -10,8 +10,11 @@ This first version is intentionally permissive: it accepts any sender and recipi
 - Supports basic SMTP commands: `HELO`/`EHLO`, `MAIL FROM`, `RCPT TO`, `DATA`, `RSET`, `NOOP`, and `QUIT`.
 - Applies a global messages-per-minute limit and a per-envelope-sender messages-per-minute limit.
 - Writes message data to a temporary directory first, then atomically renames the complete file into the inbox.
-- Keeps temporary files outside the inbox by default, so future rsync jobs can read the inbox without seeing partial messages.
+- Also writes a cleaned copy into `SMTP_CLEANED_INBOX_DIR` for LLM ingestion.
+- Keeps temporary files outside both inboxes by default, so future rsync jobs can read inboxes without seeing partial messages.
 - Prepends envelope metadata headers before the received DATA payload.
+- Message filenames use `[YYYY]-[MM]-[DD]-[base64_url encoded sha1 content hash].eml`, based on the full original stored message content.
+- Cleaned copies strip `X-*`, `ARC-*`, and `DKIM*` headers except `X-Received` and `X-SMTP*`, keep plain-text bodies, drop HTML alternatives, and keep attachments with minimal MIME headers.
 
 ## Configuration
 
@@ -21,7 +24,8 @@ Environment variables:
 | --- | --- | --- |
 | `SMTP_LISTEN_ADDR` | `0.0.0.0:2525` | TCP listen address. Use `0.0.0.0:25` in a privileged/container deployment. |
 | `SMTP_INBOX_DIR` | `inbox` | Directory where complete `.eml` files are delivered. |
-| `SMTP_TEMP_DIR` | sibling `.smtp-receiver-tmp` | Temporary write directory used before atomic rename into the inbox. |
+| `SMTP_CLEANED_INBOX_DIR` | sibling `inbox-cleaned` | Directory where stripped LLM-ingestion `.eml` files are delivered. |
+| `SMTP_TEMP_DIR` | sibling `.smtp-receiver-tmp` | Temporary write directory used before atomic rename into the inboxes. |
 | `SMTP_MAX_MESSAGE_BYTES` | `26214400` | Maximum SMTP DATA size. |
 | `SMTP_GLOBAL_RATE_PER_MINUTE` | `600` | Global accepted `MAIL FROM` commands per rolling minute. Set `0` to disable. |
 | `SMTP_SENDER_RATE_PER_MINUTE` | `60` | Per-sender accepted `MAIL FROM` commands per rolling minute. Set `0` to disable. |
@@ -56,4 +60,4 @@ QUIT
 
 ## Deployment note
 
-The service is intended to run later inside a new container on `k4`. No live container has been created yet.
+The service currently runs in CT `120` on `udo-pve2`.

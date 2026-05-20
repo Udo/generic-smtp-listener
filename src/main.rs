@@ -4,8 +4,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
+use chrono::Utc;
+use sha1::{Digest, Sha1};
 use tokio::fs;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -18,6 +22,7 @@ const MAX_COMMAND_LINE_BYTES: usize = 8 * 1024;
 struct Config {
     listen_addr: String,
     inbox_dir: PathBuf,
+    cleaned_inbox_dir: PathBuf,
     temp_dir: PathBuf,
     max_message_bytes: usize,
     global_rate_per_minute: usize,
@@ -30,6 +35,10 @@ impl Config {
             env::var("SMTP_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:2525".to_string());
         let inbox_dir =
             PathBuf::from(env::var("SMTP_INBOX_DIR").unwrap_or_else(|_| "inbox".to_string()));
+        let cleaned_inbox_dir = PathBuf::from(
+            env::var("SMTP_CLEANED_INBOX_DIR")
+                .unwrap_or_else(|_| default_cleaned_dir_for(&inbox_dir)),
+        );
         let temp_dir = match env::var("SMTP_TEMP_DIR") {
             Ok(value) => PathBuf::from(value),
             Err(_) => default_temp_dir_for(&inbox_dir),
@@ -38,6 +47,7 @@ impl Config {
         Ok(Self {
             listen_addr,
             inbox_dir,
+            cleaned_inbox_dir,
             temp_dir,
             max_message_bytes: parse_env_usize("SMTP_MAX_MESSAGE_BYTES", 25 * 1024 * 1024)?,
             global_rate_per_minute: parse_env_usize("SMTP_GLOBAL_RATE_PER_MINUTE", 600)?,
@@ -129,6 +139,7 @@ fn normalize_sender(sender: &str) -> String {
 async fn main() -> io::Result<()> {
     let config = Config::from_env()?;
     fs::create_dir_all(&config.inbox_dir).await?;
+    fs::create_dir_all(&config.cleaned_inbox_dir).await?;
     fs::create_dir_all(&config.temp_dir).await?;
 
     let listener = TcpListener::bind(&config.listen_addr).await?;
@@ -379,12 +390,9 @@ async fn persist_message(
     data: &[u8],
 ) -> io::Result<PathBuf> {
     fs::create_dir_all(&config.inbox_dir).await?;
+    fs::create_dir_all(&config.cleaned_inbox_dir).await?;
     fs::create_dir_all(&config.temp_dir).await?;
 
-    let final_path = config.inbox_dir.join(new_message_filename());
-    let temp_path = config
-        .temp_dir
-        .join(format!("{}.tmp", filename_for_path(&final_path)));
     let mut payload = Vec::new();
     payload.extend_from_slice(b"X-SMTP-Receiver-Envelope-From: ");
     payload.extend_from_slice(sender.as_bytes());
@@ -397,30 +405,348 @@ async fn persist_message(
     payload.extend_from_slice(b"\r\n");
     payload.extend_from_slice(data);
 
+    let filename = message_filename(&payload);
+    let final_path = config.inbox_dir.join(&filename);
+    let cleaned_final_path = config.cleaned_inbox_dir.join(&filename);
+    let temp_path = config.temp_dir.join(format!("{filename}.tmp"));
+    let cleaned_temp_path = config.temp_dir.join(format!("{filename}.cleaned.tmp"));
+    let cleaned_payload = clean_message_for_llm(&payload);
+
     fs::write(&temp_path, payload).await?;
-    fs::rename(&temp_path, &final_path).await?;
+    fs::write(&cleaned_temp_path, cleaned_payload).await?;
+    if let Err(error) = fs::rename(&temp_path, &final_path).await {
+        let _ = fs::remove_file(&temp_path).await;
+        let _ = fs::remove_file(&cleaned_temp_path).await;
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&cleaned_temp_path, &cleaned_final_path).await {
+        let _ = fs::remove_file(&cleaned_temp_path).await;
+        let _ = fs::remove_file(&final_path).await;
+        return Err(error);
+    }
     Ok(final_path)
 }
 
-fn filename_for_path(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("message.eml")
-        .to_string()
+#[derive(Debug, Clone)]
+struct MessagePart<'a> {
+    headers: Vec<(String, String)>,
+    body: &'a [u8],
 }
 
-fn new_message_filename() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0));
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    format!("{}.{:09}-{}.eml", now.as_secs(), now.subsec_nanos(), id)
+#[derive(Debug, Clone)]
+struct KeptPart {
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    is_attachment: bool,
+}
+
+fn clean_message_for_llm(message: &[u8]) -> Vec<u8> {
+    let root = parse_message_part(message);
+    let mut top_headers = filter_headers(&root.headers);
+    remove_header(&mut top_headers, "content-type");
+    remove_header(&mut top_headers, "content-transfer-encoding");
+    remove_header(&mut top_headers, "mime-version");
+
+    let kept_parts = collect_llm_parts(&root);
+    let mut output = Vec::new();
+    write_headers(&mut output, &top_headers);
+
+    if kept_parts.len() <= 1 && !kept_parts.first().is_some_and(|part| part.is_attachment) {
+        output.extend_from_slice(b"Content-Type: text/plain; charset=utf-8\r\n\r\n");
+        if let Some(part) = kept_parts.first() {
+            output.extend_from_slice(&part.body);
+        }
+        return output;
+    }
+
+    let boundary = format!(
+        "smtp-receiver-cleaned-{}",
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    output.extend_from_slice(b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"");
+    output.extend_from_slice(boundary.as_bytes());
+    output.extend_from_slice(b"\"\r\n\r\n");
+
+    for part in kept_parts {
+        output.extend_from_slice(b"--");
+        output.extend_from_slice(boundary.as_bytes());
+        output.extend_from_slice(b"\r\n");
+        write_headers(&mut output, &part.headers);
+        output.extend_from_slice(b"\r\n");
+        output.extend_from_slice(&part.body);
+        if !part.body.ends_with(b"\n") {
+            output.extend_from_slice(b"\r\n");
+        }
+    }
+    output.extend_from_slice(b"--");
+    output.extend_from_slice(boundary.as_bytes());
+    output.extend_from_slice(b"--\r\n");
+    output
+}
+
+fn collect_llm_parts(part: &MessagePart<'_>) -> Vec<KeptPart> {
+    let content_type = header_value(&part.headers, "content-type").unwrap_or("text/plain");
+    let media_type = media_type(content_type);
+    if media_type.starts_with("multipart/")
+        && let Some(boundary) = boundary_parameter(content_type)
+    {
+        let mut kept = Vec::new();
+        for child in split_multipart_body(part.body, &boundary) {
+            kept.extend(collect_llm_parts(&parse_message_part(child)));
+        }
+        return kept;
+    }
+
+    if is_attachment(&part.headers) {
+        return vec![KeptPart {
+            headers: minimal_attachment_headers(&part.headers),
+            body: part.body.to_vec(),
+            is_attachment: true,
+        }];
+    }
+
+    if media_type == "text/plain" {
+        return vec![KeptPart {
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
+            body: decode_text_body(&part.headers, part.body),
+            is_attachment: false,
+        }];
+    }
+
+    Vec::new()
+}
+
+fn parse_message_part(message: &[u8]) -> MessagePart<'_> {
+    let (header_bytes, body) = split_headers_body(message);
+    MessagePart {
+        headers: parse_headers(header_bytes),
+        body,
+    }
+}
+
+fn split_headers_body(message: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(index) = find_bytes(message, b"\r\n\r\n") {
+        return (&message[..index], &message[index + 4..]);
+    }
+    if let Some(index) = find_bytes(message, b"\n\n") {
+        return (&message[..index], &message[index + 2..]);
+    }
+    (message, b"")
+}
+
+fn parse_headers(header_bytes: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(header_bytes);
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some((_, value)) = headers.last_mut() {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        if let Some(colon_index) = line.find(':') {
+            let name = line[..colon_index].trim().to_string();
+            let value = line[colon_index + 1..].trim().to_string();
+            if !name.is_empty() {
+                headers.push((name, value));
+            }
+        }
+    }
+    headers
+}
+
+fn filter_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| should_keep_header(name))
+        .cloned()
+        .collect()
+}
+
+fn should_keep_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("arc-") || lower.starts_with("dkim") {
+        return false;
+    }
+    if lower.starts_with("x-") {
+        return lower == "x-received" || lower.starts_with("x-smtp");
+    }
+    true
+}
+
+fn remove_header(headers: &mut Vec<(String, String)>, name: &str) {
+    headers.retain(|(header_name, _)| !header_name.eq_ignore_ascii_case(name));
+}
+
+fn write_headers(output: &mut Vec<u8>, headers: &[(String, String)]) {
+    for (name, value) in headers {
+        if should_keep_header(name) {
+            output.extend_from_slice(name.as_bytes());
+            output.extend_from_slice(b": ");
+            output.extend_from_slice(value.as_bytes());
+            output.extend_from_slice(b"\r\n");
+        }
+    }
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn media_type(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("text/plain")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn boundary_parameter(content_type: &str) -> Option<String> {
+    parameter_value(content_type, "boundary")
+}
+
+fn parameter_value(header: &str, wanted_name: &str) -> Option<String> {
+    for parameter in header.split(';').skip(1) {
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case(wanted_name) {
+            return Some(trim_quotes(value.trim()).to_string());
+        }
+    }
+    None
+}
+
+fn trim_quotes(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|without_prefix| without_prefix.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
+fn is_attachment(headers: &[(String, String)]) -> bool {
+    header_value(headers, "content-disposition")
+        .map(|value| value.to_ascii_lowercase().starts_with("attachment"))
+        .unwrap_or(false)
+}
+
+fn minimal_attachment_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut kept = Vec::new();
+    for wanted in [
+        "Content-Type",
+        "Content-Disposition",
+        "Content-Transfer-Encoding",
+        "Content-ID",
+    ] {
+        if let Some(value) = header_value(headers, wanted) {
+            kept.push((wanted.to_string(), value.to_string()));
+        }
+    }
+    kept
+}
+
+fn decode_text_body(headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
+    let transfer_encoding = header_value(headers, "content-transfer-encoding")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let decoded = match transfer_encoding.as_str() {
+        "base64" => BASE64_STANDARD
+            .decode(without_ascii_whitespace(body))
+            .unwrap_or_else(|_| body.to_vec()),
+        "quoted-printable" => quoted_printable::decode(body, quoted_printable::ParseMode::Robust)
+            .unwrap_or_else(|_| body.to_vec()),
+        _ => body.to_vec(),
+    };
+    String::from_utf8_lossy(&decoded).into_owned().into_bytes()
+}
+
+fn without_ascii_whitespace(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect()
+}
+
+fn split_multipart_body<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
+    let marker = format!("--{boundary}");
+    let closing_marker = format!("--{boundary}--");
+    let mut parts = Vec::new();
+    let mut current_start: Option<usize> = None;
+    let mut offset: usize = 0;
+
+    for raw_line in body.split_inclusive(|byte| *byte == b'\n') {
+        let line_without_ending = trim_line_ending(raw_line);
+        if line_without_ending == marker.as_bytes()
+            || line_without_ending == closing_marker.as_bytes()
+        {
+            if let Some(start) = current_start.take() {
+                let end = offset.saturating_sub(previous_line_ending_len(body, offset));
+                if end >= start {
+                    parts.push(&body[start..end]);
+                }
+            }
+            if line_without_ending == closing_marker.as_bytes() {
+                break;
+            }
+            current_start = Some(offset + raw_line.len());
+        }
+        offset += raw_line.len();
+    }
+
+    parts
+}
+
+fn previous_line_ending_len(body: &[u8], offset: usize) -> usize {
+    if offset >= 2 && &body[offset - 2..offset] == b"\r\n" {
+        2
+    } else if offset >= 1 && body[offset - 1] == b'\n' {
+        1
+    } else {
+        0
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn message_filename(content: &[u8]) -> String {
+    let date = Utc::now().format("%Y-%m-%d");
+    let digest = Sha1::digest(content);
+    let encoded_hash = URL_SAFE_NO_PAD.encode(digest);
+    format!("{date}-{encoded_hash}.eml")
 }
 
 fn trim_line_ending(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r\n")
         .or_else(|| line.strip_suffix(b"\n"))
         .unwrap_or(line)
+}
+
+fn default_cleaned_dir_for(inbox_dir: &Path) -> String {
+    let file_name = inbox_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("inbox");
+    let cleaned_name = format!("{file_name}-cleaned");
+    match inbox_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        Some(parent) => parent.join(cleaned_name).to_string_lossy().into_owned(),
+        None => cleaned_name,
+    }
 }
 
 fn default_temp_dir_for(inbox_dir: &Path) -> PathBuf {
@@ -509,12 +835,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn message_filename_uses_utc_date_and_url_safe_sha1() {
+        let filename = message_filename(b"abc");
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+
+        assert_eq!(filename, format!("{today}-qZk-NkcGgWq6PiVxeFDCbJzQ2J0.eml"));
+    }
+
     #[tokio::test]
     async fn persist_message_renames_into_inbox_only_when_complete() {
         let temp = TempDir::new().unwrap();
         let config = Config {
             listen_addr: "127.0.0.1:0".to_string(),
             inbox_dir: temp.path().join("inbox"),
+            cleaned_inbox_dir: temp.path().join("inbox-cleaned"),
             temp_dir: temp.path().join("tmp"),
             max_message_bytes: 1024,
             global_rate_per_minute: 10,
@@ -532,11 +867,52 @@ mod tests {
 
         assert!(path.starts_with(&config.inbox_dir));
         assert!(path.exists());
+        let filename = path.file_name().unwrap().to_string_lossy();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        assert!(filename.starts_with(&format!("{today}-")));
+        assert!(filename.ends_with(".eml"));
         let entries: Vec<_> = std::fs::read_dir(&config.inbox_dir).unwrap().collect();
         assert_eq!(entries.len(), 1);
         let content = std::fs::read(path).unwrap();
         assert!(content.starts_with(b"X-SMTP-Receiver-Envelope-From: <sender@example.test>\r\n"));
         assert!(content.ends_with(b"Subject: hello\r\n\r\nbody\r\n"));
+        let cleaned_entries: Vec<_> = std::fs::read_dir(&config.cleaned_inbox_dir)
+            .unwrap()
+            .collect();
+        assert_eq!(cleaned_entries.len(), 1);
+    }
+
+    #[test]
+    fn clean_message_strips_tracking_auth_headers_html_and_keeps_plain_text() {
+        let message = b"X-SMTP-Receiver-Envelope-From: <sender@example.test>\r\nX-Received: ok\r\nX-Spam-Score: 100\r\nARC-Seal: secret\r\nDKIM-Signature: signature\r\nFrom: Sender <sender@example.test>\r\nSubject: Clean me\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=alt\r\n\r\n--alt\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nHello=20plain=20text.\r\n--alt\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body>expensive html</body></html>\r\n--alt--\r\n";
+
+        let cleaned = String::from_utf8(clean_message_for_llm(message)).unwrap();
+
+        assert!(cleaned.contains("X-SMTP-Receiver-Envelope-From: <sender@example.test>"));
+        assert!(cleaned.contains("X-Received: ok"));
+        assert!(cleaned.contains("From: Sender <sender@example.test>"));
+        assert!(cleaned.contains("Subject: Clean me"));
+        assert!(cleaned.contains("Hello plain text."));
+        assert!(!cleaned.contains("X-Spam-Score"));
+        assert!(!cleaned.contains("ARC-Seal"));
+        assert!(!cleaned.contains("DKIM-Signature"));
+        assert!(!cleaned.contains("expensive html"));
+        assert!(!cleaned.contains("multipart/alternative"));
+    }
+
+    #[test]
+    fn clean_message_keeps_attachments_with_minimal_headers() {
+        let message = b"Subject: Attachment\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=mix\r\n\r\n--mix\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n--mix\r\nContent-Type: application/pdf; name=doc.pdf\r\nContent-Disposition: attachment; filename=doc.pdf\r\nContent-Transfer-Encoding: base64\r\nX-Attachment-Tracker: remove-me\r\n\r\nJVBERi0xLjQK\r\n--mix--\r\n";
+
+        let cleaned = String::from_utf8(clean_message_for_llm(message)).unwrap();
+
+        assert!(cleaned.contains("Content-Type: multipart/mixed"));
+        assert!(cleaned.contains("See attached."));
+        assert!(cleaned.contains("Content-Type: application/pdf; name=doc.pdf"));
+        assert!(cleaned.contains("Content-Disposition: attachment; filename=doc.pdf"));
+        assert!(cleaned.contains("Content-Transfer-Encoding: base64"));
+        assert!(cleaned.contains("JVBERi0xLjQK"));
+        assert!(!cleaned.contains("X-Attachment-Tracker"));
     }
 
     #[tokio::test]
@@ -577,6 +953,8 @@ mod tests {
 
         let files = inbox_files(&config.inbox_dir);
         assert_eq!(files.len(), 1);
+        let cleaned_files = inbox_files(&config.cleaned_inbox_dir);
+        assert_eq!(cleaned_files.len(), 1);
         let content = std::fs::read(&files[0]).unwrap();
         assert!(content.starts_with(b"X-SMTP-Receiver-Envelope-From: <sender@example.test>\r\n"));
         assert!(
@@ -584,6 +962,9 @@ mod tests {
                 .windows(b"Subject: integration".len())
                 .any(|window| window == b"Subject: integration")
         );
+        let cleaned_content = std::fs::read_to_string(&cleaned_files[0]).unwrap();
+        assert!(cleaned_content.contains("Subject: integration"));
+        assert!(cleaned_content.contains("hello"));
     }
 
     #[tokio::test]
@@ -607,6 +988,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(inbox_files(&config.inbox_dir).is_empty());
+        assert!(inbox_files(&config.cleaned_inbox_dir).is_empty());
 
         write_smtp(&mut client, ".\r\n").await;
         assert_eq!(
@@ -614,6 +996,7 @@ mod tests {
             "250 message accepted\r\n"
         );
         assert_eq!(inbox_files(&config.inbox_dir).len(), 1);
+        assert_eq!(inbox_files(&config.cleaned_inbox_dir).len(), 1);
     }
 
     #[tokio::test]
@@ -664,6 +1047,7 @@ mod tests {
         Config {
             listen_addr: "127.0.0.1:0".to_string(),
             inbox_dir: root.join("inbox"),
+            cleaned_inbox_dir: root.join("inbox-cleaned"),
             temp_dir: root.join("tmp"),
             max_message_bytes,
             global_rate_per_minute: global,

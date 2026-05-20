@@ -13,7 +13,7 @@ use sha1::{Digest, Sha1};
 use tokio::fs;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_COMMAND_LINE_BYTES: usize = 8 * 1024;
@@ -27,6 +27,8 @@ struct Config {
     max_message_bytes: usize,
     global_rate_per_minute: usize,
     sender_rate_per_minute: usize,
+    max_connections: usize,
+    command_timeout_seconds: u64,
 }
 
 impl Config {
@@ -52,6 +54,8 @@ impl Config {
             max_message_bytes: parse_env_usize("SMTP_MAX_MESSAGE_BYTES", 25 * 1024 * 1024)?,
             global_rate_per_minute: parse_env_usize("SMTP_GLOBAL_RATE_PER_MINUTE", 600)?,
             sender_rate_per_minute: parse_env_usize("SMTP_SENDER_RATE_PER_MINUTE", 60)?,
+            max_connections: parse_env_usize("SMTP_MAX_CONNECTIONS", 100)?,
+            command_timeout_seconds: parse_env_u64("SMTP_COMMAND_TIMEOUT_SECONDS", 300)?,
         })
     }
 }
@@ -105,6 +109,10 @@ impl RateLimiter {
 
     fn check_and_record(&mut self, sender: &str, now: Instant) -> RateLimitDecision {
         prune_old(&mut self.global, now, self.window);
+        self.senders.retain(|_, events| {
+            prune_old(events, now, self.window);
+            !events.is_empty()
+        });
         if self.global_limit > 0 && self.global.len() >= self.global_limit {
             return RateLimitDecision::GlobalLimited;
         }
@@ -149,13 +157,25 @@ async fn main() -> io::Result<()> {
         config.inbox_dir.display()
     );
 
+    let semaphore = Arc::new(Semaphore::new(connection_limit(config.max_connections)));
     let state = Arc::new(AppState::new(config));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, peer) = accepted?;
+                let (mut stream, peer) = accepted?;
+                let permit = match Arc::clone(&semaphore).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tokio::spawn(async move {
+                            let _ = stream.write_all(b"421 too many concurrent connections; try again later\r\n").await;
+                            let _ = stream.shutdown().await;
+                        });
+                        continue;
+                    }
+                };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = handle_client(stream, state).await {
                         eprintln!("connection from {peer} ended with error: {error}");
                     }
@@ -182,13 +202,23 @@ async fn handle_client(stream: TcpStream, state: Arc<AppState>) -> io::Result<()
 
     loop {
         line.clear();
-        let bytes = match read_line_limited(&mut reader, &mut line, MAX_COMMAND_LINE_BYTES).await {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+        let timeout_duration = Duration::from_secs(state.config.command_timeout_seconds);
+        let bytes = match tokio::time::timeout(
+            timeout_duration,
+            read_line_limited(&mut reader, &mut line, MAX_COMMAND_LINE_BYTES),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
                 write_response(&mut writer, "500 command line too long\r\n").await?;
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                write_response(&mut writer, "421 idle timeout\r\n").await?;
+                return Ok(());
+            }
         };
         if bytes == 0 {
             return Ok(());
@@ -243,8 +273,13 @@ async fn handle_client(stream: TcpStream, state: Arc<AppState>) -> io::Result<()
                 continue;
             }
             write_response(&mut writer, "354 end with <CRLF>.<CRLF>\r\n").await?;
-            match read_data(&mut reader, state.config.max_message_bytes).await {
-                Ok(data) => {
+            match tokio::time::timeout(
+                Duration::from_secs(state.config.command_timeout_seconds),
+                read_data(&mut reader, state.config.max_message_bytes),
+            )
+            .await
+            {
+                Ok(Ok(data)) => {
                     let sender_value = sender.as_deref().unwrap_or("");
                     match persist_message(&state.config, sender_value, &recipients, &data).await {
                         Ok(path) => {
@@ -263,12 +298,16 @@ async fn handle_client(stream: TcpStream, state: Arc<AppState>) -> io::Result<()
                     sender = None;
                     recipients.clear();
                 }
-                Err(ReadDataError::TooLarge) => {
+                Ok(Err(ReadDataError::TooLarge)) => {
                     write_response(&mut writer, "552 message exceeds configured size limit\r\n")
                         .await?;
                     return Ok(());
                 }
-                Err(ReadDataError::Io(error)) => return Err(error),
+                Ok(Err(ReadDataError::Io(error))) => return Err(error),
+                Err(_) => {
+                    write_response(&mut writer, "421 DATA timeout\r\n").await?;
+                    return Ok(());
+                }
             }
         } else if upper == "RSET" {
             sender = None;
@@ -791,12 +830,32 @@ fn default_temp_dir_for(inbox_dir: &Path) -> PathBuf {
     }
 }
 
+fn connection_limit(configured: usize) -> usize {
+    if configured == 0 {
+        Semaphore::MAX_PERMITS
+    } else {
+        configured.min(Semaphore::MAX_PERMITS)
+    }
+}
+
 fn parse_env_usize(name: &str, default: usize) -> io::Result<usize> {
     match env::var(name) {
         Ok(value) => value.parse::<usize>().map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{name} must be a positive integer: {error}"),
+                format!("{name} must be a non-negative integer: {error}"),
+            )
+        }),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_u64(name: &str, default: u64) -> io::Result<u64> {
+    match env::var(name) {
+        Ok(value) => value.parse::<u64>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be a non-negative integer: {error}"),
             )
         }),
         Err(_) => Ok(default),
@@ -886,6 +945,8 @@ mod tests {
             max_message_bytes: 1024,
             global_rate_per_minute: 10,
             sender_rate_per_minute: 10,
+            max_connections: 100,
+            command_timeout_seconds: 300,
         };
 
         let path = persist_message(
@@ -1086,6 +1147,8 @@ mod tests {
             max_message_bytes,
             global_rate_per_minute: global,
             sender_rate_per_minute: sender,
+            max_connections: 100,
+            command_timeout_seconds: 300,
         }
     }
 

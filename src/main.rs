@@ -442,12 +442,23 @@ struct KeptPart {
 
 fn clean_message_for_llm(message: &[u8]) -> Vec<u8> {
     let root = parse_message_part(message);
+    let original_part;
+    let content_part = if has_smtp_receiver_envelope(&root.headers) {
+        original_part = parse_message_part(root.body);
+        &original_part
+    } else {
+        &root
+    };
+
     let mut top_headers = filter_headers(&root.headers);
+    if has_smtp_receiver_envelope(&root.headers) {
+        top_headers.extend(filter_headers(&content_part.headers));
+    }
     remove_header(&mut top_headers, "content-type");
     remove_header(&mut top_headers, "content-transfer-encoding");
     remove_header(&mut top_headers, "mime-version");
 
-    let kept_parts = collect_llm_parts(&root);
+    let kept_parts = collect_llm_parts(content_part);
     let mut output = Vec::new();
     write_headers(&mut output, &top_headers);
 
@@ -482,6 +493,12 @@ fn clean_message_for_llm(message: &[u8]) -> Vec<u8> {
     output.extend_from_slice(boundary.as_bytes());
     output.extend_from_slice(b"--\r\n");
     output
+}
+
+fn has_smtp_receiver_envelope(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(name, _)| name.to_ascii_lowercase().starts_with("x-smtp-receiver-"))
 }
 
 fn collect_llm_parts(part: &MessagePart<'_>) -> Vec<KeptPart> {
@@ -884,7 +901,7 @@ mod tests {
 
     #[test]
     fn clean_message_strips_tracking_auth_headers_html_and_keeps_plain_text() {
-        let message = b"X-SMTP-Receiver-Envelope-From: <sender@example.test>\r\nX-Received: ok\r\nX-Spam-Score: 100\r\nARC-Seal: secret\r\nDKIM-Signature: signature\r\nFrom: Sender <sender@example.test>\r\nSubject: Clean me\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=alt\r\n\r\n--alt\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nHello=20plain=20text.\r\n--alt\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body>expensive html</body></html>\r\n--alt--\r\n";
+        let message = b"X-SMTP-Receiver-Envelope-From: <sender@example.test>\r\n\r\nX-Received: ok\r\nX-Spam-Score: 100\r\nARC-Seal: secret\r\nDKIM-Signature: signature\r\nFrom: Sender <sender@example.test>\r\nSubject: Clean me\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=alt\r\n\r\n--alt\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nHello=20plain=20text.\r\n--alt\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body>expensive html</body></html>\r\n--alt--\r\n";
 
         let cleaned = String::from_utf8(clean_message_for_llm(message)).unwrap();
 

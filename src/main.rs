@@ -449,7 +449,7 @@ fn parse_env_usize(name: &str, default: usize) -> io::Result<usize> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use tokio::io::BufReader;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[test]
     fn rate_limiter_applies_global_and_sender_limits() {
@@ -499,6 +499,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_data_rejects_oversized_messages() {
+        let input = b"123456\r\n.\r\n";
+        let mut reader = BufReader::new(&input[..]);
+
+        assert!(matches!(
+            read_data(&mut reader, 5).await,
+            Err(ReadDataError::TooLarge)
+        ));
+    }
+
+    #[tokio::test]
     async fn persist_message_renames_into_inbox_only_when_complete() {
         let temp = TempDir::new().unwrap();
         let config = Config {
@@ -526,5 +537,182 @@ mod tests {
         let content = std::fs::read(path).unwrap();
         assert!(content.starts_with(b"X-SMTP-Receiver-Envelope-From: <sender@example.test>\r\n"));
         assert!(content.ends_with(b"Subject: hello\r\n\r\nbody\r\n"));
+    }
+
+    #[tokio::test]
+    async fn smtp_session_delivers_complete_message_file() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path(), 4096, 10, 10);
+        let mut client = start_test_server(config.clone()).await;
+
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "220 smtp-receiver ready\r\n"
+        );
+        write_smtp(&mut client, "EHLO local\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "250-smtp-receiver\r\n250-8BITMIME\r\n250 SIZE\r\n"
+        );
+        write_smtp(&mut client, "MAIL FROM:<sender@example.test>\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "250 sender accepted\r\n"
+        );
+        write_smtp(&mut client, "RCPT TO:<inbox@example.test>\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "250 recipient accepted\r\n"
+        );
+        write_smtp(&mut client, "DATA\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "354 end with <CRLF>.<CRLF>\r\n"
+        );
+        write_smtp(&mut client, "Subject: integration\r\n\r\nhello\r\n.\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "250 message accepted\r\n"
+        );
+
+        let files = inbox_files(&config.inbox_dir);
+        assert_eq!(files.len(), 1);
+        let content = std::fs::read(&files[0]).unwrap();
+        assert!(content.starts_with(b"X-SMTP-Receiver-Envelope-From: <sender@example.test>\r\n"));
+        assert!(
+            content
+                .windows(b"Subject: integration".len())
+                .any(|window| window == b"Subject: integration")
+        );
+    }
+
+    #[tokio::test]
+    async fn smtp_session_does_not_expose_partial_message_in_inbox() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path(), 4096, 10, 10);
+        let mut client = start_test_server(config.clone()).await;
+
+        read_smtp_response(&mut client).await;
+        write_smtp(&mut client, "MAIL FROM:<sender@example.test>\r\n").await;
+        read_smtp_response(&mut client).await;
+        write_smtp(&mut client, "RCPT TO:<inbox@example.test>\r\n").await;
+        read_smtp_response(&mut client).await;
+        write_smtp(&mut client, "DATA\r\n").await;
+        read_smtp_response(&mut client).await;
+        write_smtp(
+            &mut client,
+            "Subject: partial\r\n\r\nbody without terminator\r\n",
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(inbox_files(&config.inbox_dir).is_empty());
+
+        write_smtp(&mut client, ".\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "250 message accepted\r\n"
+        );
+        assert_eq!(inbox_files(&config.inbox_dir).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn smtp_session_enforces_rate_limits_without_writing_message() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path(), 4096, 1, 10);
+        let mut client = start_test_server(config.clone()).await;
+
+        read_smtp_response(&mut client).await;
+        write_smtp(&mut client, "MAIL FROM:<one@example.test>\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "250 sender accepted\r\n"
+        );
+        write_smtp(&mut client, "MAIL FROM:<two@example.test>\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "451 global rate limit exceeded; try again later\r\n"
+        );
+        write_smtp(&mut client, "DATA\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "503 MAIL FROM and RCPT TO required first\r\n"
+        );
+        assert!(inbox_files(&config.inbox_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn smtp_session_enforces_sender_rate_limit() {
+        let temp = TempDir::new().unwrap();
+        let config = test_config(temp.path(), 4096, 10, 1);
+        let mut client = start_test_server(config).await;
+
+        read_smtp_response(&mut client).await;
+        write_smtp(&mut client, "MAIL FROM:<sender@example.test>\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "250 sender accepted\r\n"
+        );
+        write_smtp(&mut client, "MAIL FROM:<sender@example.test>\r\n").await;
+        assert_eq!(
+            read_smtp_response(&mut client).await,
+            "451 sender rate limit exceeded; try again later\r\n"
+        );
+    }
+
+    fn test_config(root: &Path, max_message_bytes: usize, global: usize, sender: usize) -> Config {
+        Config {
+            listen_addr: "127.0.0.1:0".to_string(),
+            inbox_dir: root.join("inbox"),
+            temp_dir: root.join("tmp"),
+            max_message_bytes,
+            global_rate_per_minute: global,
+            sender_rate_per_minute: sender,
+        }
+    }
+
+    async fn start_test_server(config: Config) -> BufReader<TcpStream> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(AppState::new(config));
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_client(stream, state).await.unwrap();
+        });
+        BufReader::new(TcpStream::connect(addr).await.unwrap())
+    }
+
+    async fn write_smtp(client: &mut BufReader<TcpStream>, text: &str) {
+        client.get_mut().write_all(text.as_bytes()).await.unwrap();
+        client.get_mut().flush().await.unwrap();
+    }
+
+    async fn read_smtp_response(client: &mut BufReader<TcpStream>) -> String {
+        let mut response = String::new();
+        loop {
+            let mut line = String::new();
+            let bytes = client.read_line(&mut line).await.unwrap();
+            assert_ne!(bytes, 0, "server closed connection before response");
+            let is_last = line
+                .as_bytes()
+                .get(3)
+                .is_none_or(|separator| *separator != b'-');
+            response.push_str(&line);
+            if is_last {
+                return response;
+            }
+        }
+    }
+
+    fn inbox_files(inbox_dir: &Path) -> Vec<PathBuf> {
+        if !inbox_dir.exists() {
+            return Vec::new();
+        }
+        let mut files = std::fs::read_dir(inbox_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        files.sort();
+        files
     }
 }

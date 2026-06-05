@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::env;
+use std::fs as stdfs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,30 +35,46 @@ struct Config {
 
 impl Config {
     fn from_env() -> io::Result<Self> {
-        let listen_addr =
-            env::var("SMTP_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:2525".to_string());
-        let inbox_dir =
-            PathBuf::from(env::var("SMTP_INBOX_DIR").unwrap_or_else(|_| "inbox".to_string()));
+        Self::from_values(load_config_values()?)
+    }
+
+    fn from_values(values: ConfigValues) -> io::Result<Self> {
+        let listen_addr = config_string(&values, "SMTP_LISTEN_ADDR", "0.0.0.0:2525");
+        let inbox_dir = PathBuf::from(config_string(&values, "SMTP_INBOX_DIR", "inbox"));
         let cleaned_inbox_dir = PathBuf::from(
-            env::var("SMTP_CLEANED_INBOX_DIR")
-                .unwrap_or_else(|_| default_cleaned_dir_for(&inbox_dir)),
+            config_optional(&values, "SMTP_CLEANED_INBOX_DIR")
+                .unwrap_or_else(|| default_cleaned_dir_for(&inbox_dir)),
         );
-        let temp_dir = match env::var("SMTP_TEMP_DIR") {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => default_temp_dir_for(&inbox_dir),
-        };
+        let temp_dir = config_optional(&values, "SMTP_TEMP_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_temp_dir_for(&inbox_dir));
 
         Ok(Self {
             listen_addr,
             inbox_dir,
             cleaned_inbox_dir,
             temp_dir,
-            max_message_bytes: parse_env_usize("SMTP_MAX_MESSAGE_BYTES", 25 * 1024 * 1024)?,
-            global_rate_per_minute: parse_env_usize("SMTP_GLOBAL_RATE_PER_MINUTE", 600)?,
-            sender_rate_per_minute: parse_env_usize("SMTP_SENDER_RATE_PER_MINUTE", 60)?,
-            max_connections: parse_env_usize("SMTP_MAX_CONNECTIONS", 100)?,
-            command_timeout_seconds: parse_env_u64("SMTP_COMMAND_TIMEOUT_SECONDS", 300)?,
-            recipient_domains: parse_recipient_domains_env(),
+            max_message_bytes: parse_config_usize(
+                &values,
+                "SMTP_MAX_MESSAGE_BYTES",
+                25 * 1024 * 1024,
+            )?,
+            global_rate_per_minute: parse_config_usize(
+                &values,
+                "SMTP_GLOBAL_RATE_PER_MINUTE",
+                600,
+            )?,
+            sender_rate_per_minute: parse_config_usize(&values, "SMTP_SENDER_RATE_PER_MINUTE", 60)?,
+            max_connections: parse_config_usize(&values, "SMTP_MAX_CONNECTIONS", 100)?,
+            command_timeout_seconds: parse_config_u64(
+                &values,
+                "SMTP_COMMAND_TIMEOUT_SECONDS",
+                300,
+            )?,
+            recipient_domains: parse_recipient_domains(config_optional(
+                &values,
+                "SMTP_RECIPIENT_DOMAINS",
+            )),
         })
     }
 }
@@ -145,12 +162,128 @@ fn normalize_sender(sender: &str) -> String {
     sender.trim().to_ascii_lowercase()
 }
 
-fn parse_recipient_domains_env() -> Vec<String> {
-    env::var("SMTP_RECIPIENT_DOMAINS")
+type ConfigValues = HashMap<String, String>;
+
+fn load_config_values() -> io::Result<ConfigValues> {
+    let mut values = match config_file_path()? {
+        Some(path) => parse_config_file(&path)?,
+        None => ConfigValues::new(),
+    };
+
+    for key in CONFIG_KEYS {
+        if let Ok(value) = env::var(key) {
+            values.insert((*key).to_string(), value);
+        }
+    }
+    Ok(values)
+}
+
+const CONFIG_KEYS: &[&str] = &[
+    "SMTP_LISTEN_ADDR",
+    "SMTP_INBOX_DIR",
+    "SMTP_CLEANED_INBOX_DIR",
+    "SMTP_TEMP_DIR",
+    "SMTP_MAX_MESSAGE_BYTES",
+    "SMTP_GLOBAL_RATE_PER_MINUTE",
+    "SMTP_SENDER_RATE_PER_MINUTE",
+    "SMTP_MAX_CONNECTIONS",
+    "SMTP_COMMAND_TIMEOUT_SECONDS",
+    "SMTP_RECIPIENT_DOMAINS",
+];
+
+fn config_file_path() -> io::Result<Option<PathBuf>> {
+    if let Ok(value) = env::var("SMTP_CONFIG_FILE") {
+        let path = PathBuf::from(value);
+        if path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(path));
+    }
+
+    let default_path = PathBuf::from("/etc/smtp-receiver/config");
+    match stdfs::metadata(&default_path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(default_path)),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", default_path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_config_file(path: &Path) -> io::Result<ConfigValues> {
+    let content = stdfs::read_to_string(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to read config file {}: {error}", path.display()),
+        )
+    })?;
+    parse_config_text(&content)
+}
+
+fn parse_config_text(content: &str) -> io::Result<ConfigValues> {
+    let mut values = ConfigValues::new();
+    for (index, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("config line {} must use key=value syntax", index + 1),
+            ));
+        };
+        let key = normalize_config_key(key.trim());
+        if key.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("config line {} has an empty key", index + 1),
+            ));
+        }
+        values.insert(key, trim_config_value(value.trim()).to_string());
+    }
+    Ok(values)
+}
+
+fn normalize_config_key(key: &str) -> String {
+    let normalized = key.trim().replace('-', "_").to_ascii_uppercase();
+    if normalized.starts_with("SMTP_") {
+        normalized
+    } else {
+        format!("SMTP_{normalized}")
+    }
+}
+
+fn trim_config_value(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|without_prefix| without_prefix.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|without_prefix| without_prefix.strip_suffix('\''))
+        })
+        .unwrap_or(value)
+}
+
+fn config_optional(values: &ConfigValues, key: &str) -> Option<String> {
+    values.get(key).cloned().filter(|value| !value.is_empty())
+}
+
+fn config_string(values: &ConfigValues, key: &str, default: &str) -> String {
+    config_optional(values, key).unwrap_or_else(|| default.to_string())
+}
+
+fn parse_recipient_domains(value: Option<String>) -> Vec<String> {
+    value
         .unwrap_or_default()
         .split(',')
         .map(|domain| domain.trim().trim_start_matches('@').to_ascii_lowercase())
         .filter(|domain| !domain.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -989,27 +1122,27 @@ fn connection_limit(configured: usize) -> usize {
     }
 }
 
-fn parse_env_usize(name: &str, default: usize) -> io::Result<usize> {
-    match env::var(name) {
-        Ok(value) => value.parse::<usize>().map_err(|error| {
+fn parse_config_usize(values: &ConfigValues, name: &str, default: usize) -> io::Result<usize> {
+    match config_optional(values, name) {
+        Some(value) => value.parse::<usize>().map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{name} must be a non-negative integer: {error}"),
             )
         }),
-        Err(_) => Ok(default),
+        None => Ok(default),
     }
 }
 
-fn parse_env_u64(name: &str, default: u64) -> io::Result<u64> {
-    match env::var(name) {
-        Ok(value) => value.parse::<u64>().map_err(|error| {
+fn parse_config_u64(values: &ConfigValues, name: &str, default: u64) -> io::Result<u64> {
+    match config_optional(values, name) {
+        Some(value) => value.parse::<u64>().map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{name} must be a non-negative integer: {error}"),
             )
         }),
-        Err(_) => Ok(default),
+        None => Ok(default),
     }
 }
 
@@ -1018,6 +1151,49 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[test]
+    fn config_file_values_define_listener_storage_limits_and_routing_domains() {
+        let values = parse_config_text(
+            r#"
+            # bare keys and SMTP_* keys are both accepted
+            listen_addr = 127.0.0.1:2525
+            inbox_dir = /mail/dropoff
+            cleaned_inbox_dir = /mail/cleaned
+            temp_dir = /mail/tmp
+            max_message_bytes = 1024
+            global_rate_per_minute = 12
+            SMTP_SENDER_RATE_PER_MINUTE = 3
+            max_connections = 4
+            command_timeout_seconds = 5
+            recipient_domains = kautschuk.com, @undenheim.kautschuk.com, kautschuk.com
+            "#,
+        )
+        .unwrap();
+
+        let config = Config::from_values(values).unwrap();
+
+        assert_eq!(config.listen_addr, "127.0.0.1:2525");
+        assert_eq!(config.inbox_dir, PathBuf::from("/mail/dropoff"));
+        assert_eq!(config.cleaned_inbox_dir, PathBuf::from("/mail/cleaned"));
+        assert_eq!(config.temp_dir, PathBuf::from("/mail/tmp"));
+        assert_eq!(config.max_message_bytes, 1024);
+        assert_eq!(config.global_rate_per_minute, 12);
+        assert_eq!(config.sender_rate_per_minute, 3);
+        assert_eq!(config.max_connections, 4);
+        assert_eq!(config.command_timeout_seconds, 5);
+        assert_eq!(
+            config.recipient_domains,
+            vec!["kautschuk.com", "undenheim.kautschuk.com"]
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_lines_without_key_value_syntax() {
+        let error = parse_config_text("listen_addr 127.0.0.1:2525").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn rate_limiter_applies_global_and_sender_limits() {

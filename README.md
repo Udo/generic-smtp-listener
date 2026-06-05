@@ -20,9 +20,11 @@ This project is intentionally permissive: it accepts any sender and recipient an
 
 ## Configuration
 
-Environment variables:
+Configuration is read from `/etc/smtp-receiver/config` when that file exists, or from the file named by `SMTP_CONFIG_FILE`. The file uses simple `key=value` lines; blank lines and `#` comments are ignored. Keys may be written either with or without the `SMTP_` prefix, for example `listen_addr=0.0.0.0:25` or `SMTP_LISTEN_ADDR=0.0.0.0:25`.
 
-| Variable | Default | Description |
+Environment variables with the same names are still supported and override file values, mainly for local development and container orchestration.
+
+| Key / Variable | Default | Description |
 | --- | --- | --- |
 | `SMTP_LISTEN_ADDR` | `0.0.0.0:2525` | TCP listen address. Use `0.0.0.0:25` when deployed with permission to bind port 25. |
 | `SMTP_INBOX_DIR` | `inbox` | Directory where complete `.eml` files are delivered. |
@@ -34,6 +36,21 @@ Environment variables:
 | `SMTP_MAX_CONNECTIONS` | `100` | Maximum concurrent SMTP sessions. Set `0` to use Tokio's maximum semaphore permit count. |
 | `SMTP_COMMAND_TIMEOUT_SECONDS` | `300` | Idle timeout for SMTP commands and DATA reads. |
 | `SMTP_RECIPIENT_DOMAINS` | unset | Comma-separated recipient domains to route into username folders, for example `kautschuk.com,undenheim.kautschuk.com`. Matching uses envelope recipients plus `To`, `Cc`, and `Bcc` headers. If set and no recipient matches, the message is accepted but not stored. |
+
+Example config file:
+
+```ini
+listen_addr=0.0.0.0:25
+inbox_dir=/var/lib/smtp-receiver/dropoff
+cleaned_inbox_dir=/var/lib/smtp-receiver/dropoff-cleaned
+temp_dir=/var/lib/smtp-receiver/tmp
+max_message_bytes=26214400
+global_rate_per_minute=600
+sender_rate_per_minute=60
+max_connections=100
+command_timeout_seconds=300
+recipient_domains=kautschuk.com,undenheim.kautschuk.com
+```
 
 ## Local development
 

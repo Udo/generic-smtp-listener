@@ -31,6 +31,27 @@ struct Config {
     max_connections: usize,
     command_timeout_seconds: u64,
     recipient_domains: Vec<String>,
+    auth_results: AuthResultsConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthResultsConfig {
+    mode: AuthResultsMode,
+    trusted_servers: Vec<String>,
+    required_results: Vec<String>,
+    match_mode: AuthResultsMatchMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AuthResultsMode {
+    Off,
+    Require,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AuthResultsMatchMode {
+    Any,
+    All,
 }
 
 impl Config {
@@ -75,6 +96,7 @@ impl Config {
                 &values,
                 "SMTP_RECIPIENT_DOMAINS",
             )),
+            auth_results: parse_auth_results_config(&values)?,
         })
     }
 }
@@ -189,6 +211,10 @@ const CONFIG_KEYS: &[&str] = &[
     "SMTP_MAX_CONNECTIONS",
     "SMTP_COMMAND_TIMEOUT_SECONDS",
     "SMTP_RECIPIENT_DOMAINS",
+    "SMTP_AUTH_RESULTS_MODE",
+    "SMTP_AUTH_RESULTS_TRUSTED_SERVERS",
+    "SMTP_AUTH_RESULTS_REQUIRED",
+    "SMTP_AUTH_RESULTS_MATCH",
 ];
 
 fn config_file_path() -> io::Result<Option<PathBuf>> {
@@ -282,6 +308,59 @@ fn parse_recipient_domains(value: Option<String>) -> Vec<String> {
         .split(',')
         .map(|domain| domain.trim().trim_start_matches('@').to_ascii_lowercase())
         .filter(|domain| !domain.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn parse_auth_results_config(values: &ConfigValues) -> io::Result<AuthResultsConfig> {
+    let mode = match config_string(values, "SMTP_AUTH_RESULTS_MODE", "off")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "none" | "disabled" => AuthResultsMode::Off,
+        "require" | "required" => AuthResultsMode::Require,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("SMTP_AUTH_RESULTS_MODE must be off or require, got {other}"),
+            ));
+        }
+    };
+    let match_mode = match config_string(values, "SMTP_AUTH_RESULTS_MATCH", "any")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "any" => AuthResultsMatchMode::Any,
+        "all" => AuthResultsMatchMode::All,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("SMTP_AUTH_RESULTS_MATCH must be any or all, got {other}"),
+            ));
+        }
+    };
+
+    Ok(AuthResultsConfig {
+        mode,
+        trusted_servers: parse_csv_lowercase(config_optional(
+            values,
+            "SMTP_AUTH_RESULTS_TRUSTED_SERVERS",
+        )),
+        required_results: parse_csv_lowercase(config_optional(
+            values,
+            "SMTP_AUTH_RESULTS_REQUIRED",
+        )),
+        match_mode,
+    })
+}
+
+fn parse_csv_lowercase(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -426,19 +505,26 @@ async fn handle_client(stream: TcpStream, state: Arc<AppState>) -> io::Result<()
                 Ok(Ok(data)) => {
                     let sender_value = sender.as_deref().unwrap_or("");
                     match persist_message(&state.config, sender_value, &recipients, &data).await {
-                        Ok(paths) => {
-                            if paths.is_empty() {
-                                eprintln!(
-                                    "ignored message from {:?}: no configured recipient domain",
-                                    peer
-                                );
-                            } else {
-                                eprintln!(
-                                    "accepted message from {:?} into {} recipient folder(s)",
-                                    peer,
-                                    paths.len()
-                                );
-                            }
+                        Ok(DeliveryOutcome::Stored(paths)) => {
+                            eprintln!(
+                                "accepted message from {:?} into {} recipient folder(s)",
+                                peer,
+                                paths.len()
+                            );
+                            write_response(&mut writer, "250 message accepted\r\n").await?;
+                        }
+                        Ok(DeliveryOutcome::IgnoredNoMatchingRecipient) => {
+                            eprintln!(
+                                "ignored message from {:?}: no configured recipient domain",
+                                peer
+                            );
+                            write_response(&mut writer, "250 message accepted\r\n").await?;
+                        }
+                        Ok(DeliveryOutcome::IgnoredAuthResults) => {
+                            eprintln!(
+                                "ignored message from {:?}: authentication-results policy not satisfied",
+                                peer
+                            );
                             write_response(&mut writer, "250 message accepted\r\n").await?;
                         }
                         Err(error) => {
@@ -577,12 +663,19 @@ fn is_data_terminator(line: &[u8]) -> bool {
     line == b".\r\n" || line == b".\n" || line == b"."
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DeliveryOutcome {
+    Stored(Vec<PathBuf>),
+    IgnoredNoMatchingRecipient,
+    IgnoredAuthResults,
+}
+
 async fn persist_message(
     config: &Config,
     sender: &str,
     recipients: &[String],
     data: &[u8],
-) -> io::Result<Vec<PathBuf>> {
+) -> io::Result<DeliveryOutcome> {
     fs::create_dir_all(&config.inbox_dir).await?;
     fs::create_dir_all(&config.cleaned_inbox_dir).await?;
     fs::create_dir_all(&config.temp_dir).await?;
@@ -599,10 +692,14 @@ async fn persist_message(
     payload.extend_from_slice(b"\r\n");
     payload.extend_from_slice(data);
 
+    if !message_satisfies_auth_results_policy(&config.auth_results, data) {
+        return Ok(DeliveryOutcome::IgnoredAuthResults);
+    }
+
     let recipient_folders =
         recipient_folders_for_message(&config.recipient_domains, recipients, data);
     if !config.recipient_domains.is_empty() && recipient_folders.is_empty() {
-        return Ok(Vec::new());
+        return Ok(DeliveryOutcome::IgnoredNoMatchingRecipient);
     }
 
     let filename = message_filename(&payload);
@@ -653,7 +750,7 @@ async fn persist_message(
         written_paths.push(final_path);
         written_cleaned_paths.push(cleaned_final_path);
     }
-    Ok(written_paths)
+    Ok(DeliveryOutcome::Stored(written_paths))
 }
 
 async fn cleanup_written_files(paths: &[PathBuf], cleaned_paths: &[PathBuf]) {
@@ -662,6 +759,51 @@ async fn cleanup_written_files(paths: &[PathBuf], cleaned_paths: &[PathBuf]) {
     }
     for path in cleaned_paths {
         let _ = fs::remove_file(path).await;
+    }
+}
+
+fn message_satisfies_auth_results_policy(config: &AuthResultsConfig, data: &[u8]) -> bool {
+    if config.mode == AuthResultsMode::Off {
+        return true;
+    }
+    if config.trusted_servers.is_empty() || config.required_results.is_empty() {
+        return false;
+    }
+
+    let (header_bytes, _) = split_headers_body(data);
+    parse_headers(header_bytes)
+        .into_iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("authentication-results"))
+        .any(|(_, value)| auth_results_header_satisfies(config, &value))
+}
+
+fn auth_results_header_satisfies(config: &AuthResultsConfig, value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let authserv_id = lower
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.');
+    if !config
+        .trusted_servers
+        .iter()
+        .any(|trusted| trusted.trim_end_matches('.') == authserv_id)
+    {
+        return false;
+    }
+
+    match config.match_mode {
+        AuthResultsMatchMode::Any => config
+            .required_results
+            .iter()
+            .any(|required| lower.contains(required)),
+        AuthResultsMatchMode::All => config
+            .required_results
+            .iter()
+            .all(|required| lower.contains(required)),
     }
 }
 
@@ -1167,6 +1309,10 @@ mod tests {
             max_connections = 4
             command_timeout_seconds = 5
             recipient_domains = kautschuk.com, @undenheim.kautschuk.com, kautschuk.com
+            auth_results_mode = require
+            auth_results_trusted_servers = mx.google.com
+            auth_results_required = dkim=pass, dmarc=pass
+            auth_results_match = any
             "#,
         )
         .unwrap();
@@ -1186,6 +1332,13 @@ mod tests {
             config.recipient_domains,
             vec!["kautschuk.com", "undenheim.kautschuk.com"]
         );
+        assert_eq!(config.auth_results.mode, AuthResultsMode::Require);
+        assert_eq!(config.auth_results.trusted_servers, vec!["mx.google.com"]);
+        assert_eq!(
+            config.auth_results.required_results,
+            vec!["dkim=pass", "dmarc=pass"]
+        );
+        assert_eq!(config.auth_results.match_mode, AuthResultsMatchMode::Any);
     }
 
     #[test]
@@ -1275,9 +1428,10 @@ mod tests {
             max_connections: 100,
             command_timeout_seconds: 300,
             recipient_domains: Vec::new(),
+            auth_results: auth_results_off(),
         };
 
-        let paths = persist_message(
+        let outcome = persist_message(
             &config,
             "<sender@example.test>",
             &["<rcpt@example.test>".to_string()],
@@ -1286,6 +1440,7 @@ mod tests {
         .await
         .unwrap();
 
+        let paths = stored_paths(outcome);
         assert_eq!(paths.len(), 1);
         let path = &paths[0];
         assert!(path.starts_with(&config.inbox_dir));
@@ -1314,7 +1469,7 @@ mod tests {
             "undenheim.kautschuk.com".to_string(),
         ];
 
-        let paths = persist_message(
+        let outcome = persist_message(
             &config,
             "<sender@example.test>",
             &["<udo@kautschuk.com>".to_string()],
@@ -1323,6 +1478,7 @@ mod tests {
         .await
         .unwrap();
 
+        let paths = stored_paths(outcome);
         assert_eq!(paths.len(), 2);
         assert!(
             paths
@@ -1349,7 +1505,7 @@ mod tests {
         let mut config = test_config(temp.path(), 4096, 10, 10);
         config.recipient_domains = vec!["kautschuk.com".to_string()];
 
-        let paths = persist_message(
+        let outcome = persist_message(
             &config,
             "<sender@example.test>",
             &["<outside@example.test>".to_string()],
@@ -1358,9 +1514,56 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(paths.is_empty());
+        assert_eq!(outcome, DeliveryOutcome::IgnoredNoMatchingRecipient);
         assert!(inbox_files(&config.inbox_dir).is_empty());
         assert!(inbox_files(&config.cleaned_inbox_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_message_ignores_when_auth_results_policy_fails() {
+        let temp = TempDir::new().unwrap();
+        let mut config = test_config(temp.path(), 4096, 10, 10);
+        config.auth_results = AuthResultsConfig {
+            mode: AuthResultsMode::Require,
+            trusted_servers: vec!["mx.google.com".to_string()],
+            required_results: vec!["dmarc=pass".to_string()],
+            match_mode: AuthResultsMatchMode::Any,
+        };
+
+        let outcome = persist_message(
+            &config,
+            "<sender@example.test>",
+            &["<rcpt@example.test>".to_string()],
+            b"Authentication-Results: mx.google.com; dkim=pass header.i=@example.test\r\nSubject: no dmarc\r\n\r\nbody\r\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::IgnoredAuthResults);
+        assert!(inbox_files(&config.inbox_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_message_stores_when_auth_results_policy_passes() {
+        let temp = TempDir::new().unwrap();
+        let mut config = test_config(temp.path(), 4096, 10, 10);
+        config.auth_results = AuthResultsConfig {
+            mode: AuthResultsMode::Require,
+            trusted_servers: vec!["mx.google.com".to_string()],
+            required_results: vec!["dkim=pass".to_string(), "dmarc=pass".to_string()],
+            match_mode: AuthResultsMatchMode::Any,
+        };
+
+        let outcome = persist_message(
+            &config,
+            "<sender@example.test>",
+            &["<rcpt@example.test>".to_string()],
+            b"Authentication-Results: mx.google.com; spf=pass; dkim=pass header.i=@example.test\r\nSubject: pass\r\n\r\nbody\r\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stored_paths(outcome).len(), 1);
     }
 
     #[test]
@@ -1553,6 +1756,23 @@ mod tests {
             max_connections: 100,
             command_timeout_seconds: 300,
             recipient_domains: Vec::new(),
+            auth_results: auth_results_off(),
+        }
+    }
+
+    fn auth_results_off() -> AuthResultsConfig {
+        AuthResultsConfig {
+            mode: AuthResultsMode::Off,
+            trusted_servers: Vec::new(),
+            required_results: Vec::new(),
+            match_mode: AuthResultsMatchMode::Any,
+        }
+    }
+
+    fn stored_paths(outcome: DeliveryOutcome) -> Vec<PathBuf> {
+        match outcome {
+            DeliveryOutcome::Stored(paths) => paths,
+            other => panic!("expected stored delivery, got {other:?}"),
         }
     }
 

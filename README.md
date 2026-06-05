@@ -36,6 +36,10 @@ Environment variables with the same names are still supported and override file 
 | `SMTP_MAX_CONNECTIONS` | `100` | Maximum concurrent SMTP sessions. Set `0` to use Tokio's maximum semaphore permit count. |
 | `SMTP_COMMAND_TIMEOUT_SECONDS` | `300` | Idle timeout for SMTP commands and DATA reads. |
 | `SMTP_RECIPIENT_DOMAINS` | unset | Comma-separated recipient domains to route into username folders, for example `kautschuk.com,undenheim.kautschuk.com`. Matching uses envelope recipients plus `To`, `Cc`, and `Bcc` headers. If set and no recipient matches, the message is accepted but not stored. |
+| `SMTP_AUTH_RESULTS_MODE` | `off` | Offline `Authentication-Results` gate. Use `require` to accept but not store messages unless a trusted `Authentication-Results` header satisfies the configured result requirements. This makes no DNS or network requests and is only as trustworthy as the configured upstream path. |
+| `SMTP_AUTH_RESULTS_TRUSTED_SERVERS` | unset | Comma-separated authserv-id values whose `Authentication-Results` headers may be trusted, for example `mx.google.com`. Required when `SMTP_AUTH_RESULTS_MODE=require`. |
+| `SMTP_AUTH_RESULTS_REQUIRED` | unset | Comma-separated lowercase result fragments to require inside a trusted header, for example `dkim=pass,dmarc=pass`. Required when `SMTP_AUTH_RESULTS_MODE=require`. |
+| `SMTP_AUTH_RESULTS_MATCH` | `any` | Whether `any` or `all` configured required result fragments must appear in the trusted `Authentication-Results` header. |
 
 Example config file:
 
@@ -50,6 +54,10 @@ sender_rate_per_minute=60
 max_connections=100
 command_timeout_seconds=300
 recipient_domains=kautschuk.com,undenheim.kautschuk.com
+auth_results_mode=require
+auth_results_trusted_servers=mx.google.com
+auth_results_required=dkim=pass,dmarc=pass
+auth_results_match=any
 ```
 
 ## Local development

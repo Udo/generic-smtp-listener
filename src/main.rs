@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,7 @@ struct Config {
     sender_rate_per_minute: usize,
     max_connections: usize,
     command_timeout_seconds: u64,
+    recipient_domains: Vec<String>,
 }
 
 impl Config {
@@ -56,6 +57,7 @@ impl Config {
             sender_rate_per_minute: parse_env_usize("SMTP_SENDER_RATE_PER_MINUTE", 60)?,
             max_connections: parse_env_usize("SMTP_MAX_CONNECTIONS", 100)?,
             command_timeout_seconds: parse_env_u64("SMTP_COMMAND_TIMEOUT_SECONDS", 300)?,
+            recipient_domains: parse_recipient_domains_env(),
         })
     }
 }
@@ -141,6 +143,15 @@ fn prune_old(events: &mut VecDeque<Instant>, now: Instant, window: Duration) {
 
 fn normalize_sender(sender: &str) -> String {
     sender.trim().to_ascii_lowercase()
+}
+
+fn parse_recipient_domains_env() -> Vec<String> {
+    env::var("SMTP_RECIPIENT_DOMAINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|domain| domain.trim().trim_start_matches('@').to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty())
+        .collect()
 }
 
 #[tokio::main]
@@ -282,8 +293,19 @@ async fn handle_client(stream: TcpStream, state: Arc<AppState>) -> io::Result<()
                 Ok(Ok(data)) => {
                     let sender_value = sender.as_deref().unwrap_or("");
                     match persist_message(&state.config, sender_value, &recipients, &data).await {
-                        Ok(path) => {
-                            eprintln!("accepted message from {:?} into {}", peer, path.display());
+                        Ok(paths) => {
+                            if paths.is_empty() {
+                                eprintln!(
+                                    "ignored message from {:?}: no configured recipient domain",
+                                    peer
+                                );
+                            } else {
+                                eprintln!(
+                                    "accepted message from {:?} into {} recipient folder(s)",
+                                    peer,
+                                    paths.len()
+                                );
+                            }
                             write_response(&mut writer, "250 message accepted\r\n").await?;
                         }
                         Err(error) => {
@@ -427,7 +449,7 @@ async fn persist_message(
     sender: &str,
     recipients: &[String],
     data: &[u8],
-) -> io::Result<PathBuf> {
+) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(&config.inbox_dir).await?;
     fs::create_dir_all(&config.cleaned_inbox_dir).await?;
     fs::create_dir_all(&config.temp_dir).await?;
@@ -444,26 +466,155 @@ async fn persist_message(
     payload.extend_from_slice(b"\r\n");
     payload.extend_from_slice(data);
 
-    let filename = message_filename(&payload);
-    let final_path = config.inbox_dir.join(&filename);
-    let cleaned_final_path = config.cleaned_inbox_dir.join(&filename);
-    let temp_path = config.temp_dir.join(format!("{filename}.tmp"));
-    let cleaned_temp_path = config.temp_dir.join(format!("{filename}.cleaned.tmp"));
-    let cleaned_payload = clean_message_for_llm(&payload);
+    let recipient_folders =
+        recipient_folders_for_message(&config.recipient_domains, recipients, data);
+    if !config.recipient_domains.is_empty() && recipient_folders.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    fs::write(&temp_path, payload).await?;
-    fs::write(&cleaned_temp_path, cleaned_payload).await?;
-    if let Err(error) = fs::rename(&temp_path, &final_path).await {
-        let _ = fs::remove_file(&temp_path).await;
-        let _ = fs::remove_file(&cleaned_temp_path).await;
-        return Err(error);
+    let filename = message_filename(&payload);
+    let cleaned_payload = clean_message_for_llm(&payload);
+    let target_dirs = if config.recipient_domains.is_empty() {
+        vec![(config.inbox_dir.clone(), config.cleaned_inbox_dir.clone())]
+    } else {
+        recipient_folders
+            .into_iter()
+            .map(|folder| {
+                (
+                    config.inbox_dir.join(&folder),
+                    config.cleaned_inbox_dir.join(&folder),
+                )
+            })
+            .collect()
+    };
+
+    let delivery_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut written_paths = Vec::new();
+    let mut written_cleaned_paths = Vec::new();
+    for (index, (inbox_dir, cleaned_inbox_dir)) in target_dirs.into_iter().enumerate() {
+        fs::create_dir_all(&inbox_dir).await?;
+        fs::create_dir_all(&cleaned_inbox_dir).await?;
+        let final_path = inbox_dir.join(&filename);
+        let cleaned_final_path = cleaned_inbox_dir.join(&filename);
+        let temp_path = config
+            .temp_dir
+            .join(format!("{filename}.{delivery_id}.{index}.tmp"));
+        let cleaned_temp_path = config
+            .temp_dir
+            .join(format!("{filename}.{delivery_id}.{index}.cleaned.tmp"));
+
+        fs::write(&temp_path, &payload).await?;
+        fs::write(&cleaned_temp_path, &cleaned_payload).await?;
+        if let Err(error) = fs::rename(&temp_path, &final_path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            let _ = fs::remove_file(&cleaned_temp_path).await;
+            cleanup_written_files(&written_paths, &written_cleaned_paths).await;
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&cleaned_temp_path, &cleaned_final_path).await {
+            let _ = fs::remove_file(&cleaned_temp_path).await;
+            let _ = fs::remove_file(&final_path).await;
+            cleanup_written_files(&written_paths, &written_cleaned_paths).await;
+            return Err(error);
+        }
+        written_paths.push(final_path);
+        written_cleaned_paths.push(cleaned_final_path);
     }
-    if let Err(error) = fs::rename(&cleaned_temp_path, &cleaned_final_path).await {
-        let _ = fs::remove_file(&cleaned_temp_path).await;
-        let _ = fs::remove_file(&final_path).await;
-        return Err(error);
+    Ok(written_paths)
+}
+
+async fn cleanup_written_files(paths: &[PathBuf], cleaned_paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path).await;
     }
-    Ok(final_path)
+    for path in cleaned_paths {
+        let _ = fs::remove_file(path).await;
+    }
+}
+
+fn recipient_folders_for_message(
+    recipient_domains: &[String],
+    envelope_recipients: &[String],
+    data: &[u8],
+) -> Vec<String> {
+    if recipient_domains.is_empty() {
+        return Vec::new();
+    }
+
+    let mut folders = BTreeSet::new();
+    for recipient in envelope_recipients {
+        collect_recipient_folders(recipient, recipient_domains, &mut folders);
+    }
+
+    let (header_bytes, _) = split_headers_body(data);
+    for (name, value) in parse_headers(header_bytes) {
+        if name.eq_ignore_ascii_case("to")
+            || name.eq_ignore_ascii_case("cc")
+            || name.eq_ignore_ascii_case("bcc")
+        {
+            collect_recipient_folders(&value, recipient_domains, &mut folders);
+        }
+    }
+
+    folders.into_iter().collect()
+}
+
+fn collect_recipient_folders(
+    text: &str,
+    recipient_domains: &[String],
+    folders: &mut BTreeSet<String>,
+) {
+    for at_index in text.match_indices('@').map(|(index, _)| index) {
+        let local_start = local_part_start(text, at_index);
+        let domain_end = domain_end(text, at_index + 1);
+        if local_start == at_index || domain_end == at_index + 1 {
+            continue;
+        }
+        let domain = text[at_index + 1..domain_end].to_ascii_lowercase();
+        if !recipient_domains.iter().any(|wanted| wanted == &domain) {
+            continue;
+        }
+        let local = &text[local_start..at_index];
+        let username = local.split_once('+').map_or(local, |(base, _)| base);
+        if is_safe_folder_name(username) {
+            folders.insert(username.to_ascii_lowercase());
+        }
+    }
+}
+
+fn local_part_start(text: &str, at_index: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = at_index;
+    while index > 0 && is_local_part_byte(bytes[index - 1]) {
+        index -= 1;
+    }
+    index
+}
+
+fn domain_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = start;
+    while index < bytes.len() && is_domain_byte(bytes[index]) {
+        index += 1;
+    }
+    index
+}
+
+fn is_local_part_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'%' | b'+' | b'-')
+}
+
+fn is_domain_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')
+}
+
+fn is_safe_folder_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[derive(Debug, Clone)]
@@ -947,9 +1098,10 @@ mod tests {
             sender_rate_per_minute: 10,
             max_connections: 100,
             command_timeout_seconds: 300,
+            recipient_domains: Vec::new(),
         };
 
-        let path = persist_message(
+        let paths = persist_message(
             &config,
             "<sender@example.test>",
             &["<rcpt@example.test>".to_string()],
@@ -958,6 +1110,8 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
         assert!(path.starts_with(&config.inbox_dir));
         assert!(path.exists());
         let filename = path.file_name().unwrap().to_string_lossy();
@@ -973,6 +1127,79 @@ mod tests {
             .unwrap()
             .collect();
         assert_eq!(cleaned_entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persist_message_routes_to_configured_recipient_username_folders() {
+        let temp = TempDir::new().unwrap();
+        let mut config = test_config(temp.path(), 4096, 10, 10);
+        config.recipient_domains = vec![
+            "kautschuk.com".to_string(),
+            "undenheim.kautschuk.com".to_string(),
+        ];
+
+        let paths = persist_message(
+            &config,
+            "<sender@example.test>",
+            &["<udo@kautschuk.com>".to_string()],
+            b"To: Other <other@example.test>\r\nCc: Alice <alice@undenheim.kautschuk.com>, udo+tag@kautschuk.com\r\n\r\nbody\r\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(paths.len(), 2);
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.starts_with(config.inbox_dir.join("udo")))
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.starts_with(config.inbox_dir.join("alice")))
+        );
+        assert_eq!(inbox_files(&config.inbox_dir.join("udo")).len(), 1);
+        assert_eq!(inbox_files(&config.inbox_dir.join("alice")).len(), 1);
+        assert_eq!(inbox_files(&config.cleaned_inbox_dir.join("udo")).len(), 1);
+        assert_eq!(
+            inbox_files(&config.cleaned_inbox_dir.join("alice")).len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_message_ignores_when_no_configured_recipient_domain_matches() {
+        let temp = TempDir::new().unwrap();
+        let mut config = test_config(temp.path(), 4096, 10, 10);
+        config.recipient_domains = vec!["kautschuk.com".to_string()];
+
+        let paths = persist_message(
+            &config,
+            "<sender@example.test>",
+            &["<outside@example.test>".to_string()],
+            b"To: outside@example.test\r\n\r\nbody\r\n",
+        )
+        .await
+        .unwrap();
+
+        assert!(paths.is_empty());
+        assert!(inbox_files(&config.inbox_dir).is_empty());
+        assert!(inbox_files(&config.cleaned_inbox_dir).is_empty());
+    }
+
+    #[test]
+    fn recipient_folder_detection_uses_to_cc_bcc_and_exact_domains() {
+        let domains = vec![
+            "kautschuk.com".to_string(),
+            "undenheim.kautschuk.com".to_string(),
+        ];
+        let folders = recipient_folders_for_message(
+            &domains,
+            &["<bcc@kautschuk.com>".to_string()],
+            b"To: Udo <UDO@kautschuk.com>, bad@evil-kautschuk.com\r\nCc: team@undenheim.kautschuk.com\r\nBcc: hidden@kautschuk.com\r\n\r\nbody\r\n",
+        );
+
+        assert_eq!(folders, vec!["bcc", "hidden", "team", "udo"]);
     }
 
     #[test]
@@ -1149,6 +1376,7 @@ mod tests {
             sender_rate_per_minute: sender,
             max_connections: 100,
             command_timeout_seconds: 300,
+            recipient_domains: Vec::new(),
         }
     }
 

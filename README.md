@@ -12,6 +12,7 @@ This project is intentionally permissive: it accepts any sender and recipient an
 - Applies a concurrent connection limit and an idle command/DATA timeout.
 - Writes message data to a temporary directory first, then atomically renames the complete file into the inbox.
 - Also writes a cleaned copy into `SMTP_CLEANED_INBOX_DIR` for LLM ingestion.
+- When `SMTP_RECIPIENT_DOMAINS` is set, only messages addressed to those domains are stored, with one copy per matching local-part username folder.
 - Keeps temporary files outside both inboxes by default, so rsync jobs can read inboxes without seeing partial messages.
 - Prepends envelope metadata headers before the received DATA payload.
 - Message filenames use `[YYYY]-[MM]-[DD]-[base64_url encoded sha1 content hash].eml`, based on the full stored message content.
@@ -32,6 +33,7 @@ Environment variables:
 | `SMTP_SENDER_RATE_PER_MINUTE` | `60` | Per-sender accepted `MAIL FROM` commands per rolling minute. Set `0` to disable. |
 | `SMTP_MAX_CONNECTIONS` | `100` | Maximum concurrent SMTP sessions. Set `0` to use Tokio's maximum semaphore permit count. |
 | `SMTP_COMMAND_TIMEOUT_SECONDS` | `300` | Idle timeout for SMTP commands and DATA reads. |
+| `SMTP_RECIPIENT_DOMAINS` | unset | Comma-separated recipient domains to route into username folders, for example `kautschuk.com,undenheim.kautschuk.com`. Matching uses envelope recipients plus `To`, `Cc`, and `Bcc` headers. If set and no recipient matches, the message is accepted but not stored. |
 
 ## Local development
 

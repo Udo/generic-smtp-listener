@@ -850,7 +850,10 @@ fn collect_recipient_folders(
             continue;
         }
         let local = &text[local_start..at_index];
-        let username = local.split_once('+').map_or(local, |(base, _)| base);
+        let username = local
+            .split_once('+')
+            .or_else(|| local.split_once('#'))
+            .map_or(local, |(base, _)| base);
         if is_safe_folder_name(username) {
             folders.insert(username.to_ascii_lowercase());
         }
@@ -876,7 +879,7 @@ fn domain_end(text: &str, start: usize) -> usize {
 }
 
 fn is_local_part_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'%' | b'+' | b'-')
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'%' | b'+' | b'#' | b'-')
 }
 
 fn is_domain_byte(byte: u8) -> bool {
@@ -1579,6 +1582,21 @@ mod tests {
         );
 
         assert_eq!(folders, vec!["bcc", "hidden", "team", "udo"]);
+    }
+
+    #[test]
+    fn recipient_folder_detection_strips_plus_and_hash_detail_suffixes() {
+        let domains = vec!["undenheim.kautschuk.com".to_string()];
+        let folders = recipient_folders_for_message(
+            &domains,
+            &[
+                "<orders#protocol@undenheim.kautschuk.com>".to_string(),
+                "<udo+scanner@undenheim.kautschuk.com>".to_string(),
+            ],
+            b"To: orders#other@undenheim.kautschuk.com\r\n\r\nbody\r\n",
+        );
+
+        assert_eq!(folders, vec!["orders", "udo"]);
     }
 
     #[test]

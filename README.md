@@ -4,14 +4,6 @@ A small persistent SMTP listener that accepts incoming mail and writes each comp
 
 This project is intentionally permissive: it accepts any sender and recipient and does not perform spam filtering. It is intended for private capture/ingestion workflows, not as a full MTA replacement.
 
-## Operations policy: no hosted CI or external automation by default
-
-This repository must not contain GitHub Actions or any hosted CI/CD/external automation unless Udo explicitly requests it and approves the cost/risk.
-
-Incident record: `.github/workflows/ci.yml` was previously added without explicit approval and generated GitHub “Actions Linux” usage/charges. It was removed in commit `016c36d chore: disable GitHub Actions CI`. Do not reintroduce `.github/workflows/*`, cloud runners, scheduled SaaS jobs, deploy hooks, package-publish automation, or webhooks as a convenience/default.
-
-Before pushing to GitHub, check that no workflow files or external automation configs were added unless the current task explicitly authorizes them.
-
 ## Behavior
 
 - Listens on `SMTP_LISTEN_ADDR` (default `0.0.0.0:2525`).

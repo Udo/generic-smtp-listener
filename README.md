@@ -13,6 +13,7 @@ This project is intentionally permissive: it accepts any sender and recipient an
 - Writes message data to a temporary directory first, then atomically renames the complete file into the inbox.
 - Also writes a cleaned copy into `SMTP_CLEANED_INBOX_DIR` for LLM ingestion.
 - When `SMTP_RECIPIENT_DOMAINS` is set, only messages addressed to those domains are stored, with one copy per matching local-part username folder.
+- Can POST a local HTTP webhook after a message is stored, so an internal app can import or notify the recipient address.
 - Keeps temporary files outside both inboxes by default, so rsync jobs can read inboxes without seeing partial messages.
 - Prepends envelope metadata headers before the received DATA payload.
 - Message filenames use `[YYYY]-[MM]-[DD]-[base64_url encoded sha1 content hash].eml`, based on the full stored message content.
@@ -40,6 +41,9 @@ Environment variables with the same names are still supported and override file 
 | `SMTP_AUTH_RESULTS_TRUSTED_SERVERS` | unset | Comma-separated authserv-id values whose `Authentication-Results` headers may be trusted, for example `mx.google.com`. Required when `SMTP_AUTH_RESULTS_MODE=require`. |
 | `SMTP_AUTH_RESULTS_REQUIRED` | unset | Comma-separated lowercase result fragments to require inside a trusted header, for example `dkim=pass,dmarc=pass`. Required when `SMTP_AUTH_RESULTS_MODE=require`. |
 | `SMTP_AUTH_RESULTS_MATCH` | `any` | Whether `any` or `all` configured required result fragments must appear in the trusted `Authentication-Results` header. |
+| `SMTP_WEBHOOK_URL` | unset | Optional HTTP webhook URL called after successful storage. Only `http://` is supported to avoid adding a TLS client dependency; keep it on trusted local/internal networks. The SMTP delivery remains accepted if the webhook fails. |
+| `SMTP_WEBHOOK_TOKEN` | unset | Optional bearer token sent as `Authorization: Bearer ...` with webhook requests. |
+| `SMTP_WEBHOOK_TIMEOUT_SECONDS` | `5` | Webhook request timeout. |
 
 Example config file:
 
@@ -58,6 +62,9 @@ auth_results_mode=require
 auth_results_trusted_servers=mx.google.com
 auth_results_required=dkim=pass,dmarc=pass
 auth_results_match=any
+webhook_url=http://127.0.0.1:8080/new-mail
+webhook_token=local-shared-secret
+webhook_timeout_seconds=5
 ```
 
 ## Local development
@@ -89,8 +96,24 @@ body
 QUIT
 ```
 
+## Webhook payload
+
+When enabled, the receiver sends one `POST` after a message has been atomically written. Payload example:
+
+```json
+{
+  "event": "message_stored",
+  "sender": "<sender@example.test>",
+  "recipients": ["<udo@example.test>"],
+  "stored_paths": ["/var/lib/smtp-receiver/dropoff/udo/2026-06-20-....eml"]
+}
+```
+
+Webhook failure is logged to stderr and does not roll back or reject SMTP delivery.
+
 ## Security notes
 
 - This listener is deliberately accepting. Put it behind appropriate network controls for your use case.
+- Webhooks are disabled by default. If enabled, point them at a trusted local/internal endpoint; external webhook URLs can leak metadata and create an operational dependency.
 - The cleaned inbox is for token reduction, not for security sanitization. Treat email contents and attachments as untrusted input.
 - The server does not implement authentication, TLS, spam filtering, DKIM/SPF/DMARC validation, mailbox routing, or outbound mail delivery.

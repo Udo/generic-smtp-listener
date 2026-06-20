@@ -12,7 +12,7 @@ use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_P
 use chrono::Utc;
 use sha1::{Digest, Sha1};
 use tokio::fs;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 
@@ -32,6 +32,7 @@ struct Config {
     command_timeout_seconds: u64,
     recipient_domains: Vec<String>,
     auth_results: AuthResultsConfig,
+    webhook: WebhookConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +41,20 @@ struct AuthResultsConfig {
     trusted_servers: Vec<String>,
     required_results: Vec<String>,
     match_mode: AuthResultsMatchMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WebhookConfig {
+    url: Option<WebhookUrl>,
+    bearer_token: Option<String>,
+    timeout_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WebhookUrl {
+    host: String,
+    port: u16,
+    path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +112,7 @@ impl Config {
                 "SMTP_RECIPIENT_DOMAINS",
             )),
             auth_results: parse_auth_results_config(&values)?,
+            webhook: parse_webhook_config(&values)?,
         })
     }
 }
@@ -215,6 +231,9 @@ const CONFIG_KEYS: &[&str] = &[
     "SMTP_AUTH_RESULTS_TRUSTED_SERVERS",
     "SMTP_AUTH_RESULTS_REQUIRED",
     "SMTP_AUTH_RESULTS_MATCH",
+    "SMTP_WEBHOOK_URL",
+    "SMTP_WEBHOOK_TOKEN",
+    "SMTP_WEBHOOK_TIMEOUT_SECONDS",
 ];
 
 fn config_file_path() -> io::Result<Option<PathBuf>> {
@@ -366,6 +385,51 @@ fn parse_csv_lowercase(value: Option<String>) -> Vec<String> {
         .collect()
 }
 
+fn parse_webhook_config(values: &ConfigValues) -> io::Result<WebhookConfig> {
+    let url = match config_optional(values, "SMTP_WEBHOOK_URL") {
+        Some(value) if !value.trim().is_empty() => Some(parse_webhook_url(value.trim())?),
+        _ => None,
+    };
+    Ok(WebhookConfig {
+        url,
+        bearer_token: config_optional(values, "SMTP_WEBHOOK_TOKEN")
+            .filter(|value| !value.trim().is_empty()),
+        timeout_seconds: parse_config_u64(values, "SMTP_WEBHOOK_TIMEOUT_SECONDS", 5)?,
+    })
+}
+
+fn parse_webhook_url(value: &str) -> io::Result<WebhookUrl> {
+    let Some(rest) = value.strip_prefix("http://") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SMTP_WEBHOOK_URL must use http://; https is intentionally unsupported without a TLS client dependency",
+        ));
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, "/".to_string()),
+    };
+    if authority.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SMTP_WEBHOOK_URL host must not be empty",
+        ));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => {
+            let port = port.parse::<u16>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("SMTP_WEBHOOK_URL port must be valid: {error}"),
+                )
+            })?;
+            (host.to_string(), port)
+        }
+        _ => (authority.to_string(), 80),
+    };
+    Ok(WebhookUrl { host, port, path })
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let config = Config::from_env()?;
@@ -511,6 +575,19 @@ async fn handle_client(stream: TcpStream, state: Arc<AppState>) -> io::Result<()
                                 peer,
                                 paths.len()
                             );
+                            if let Err(error) = notify_webhook(
+                                &state.config.webhook,
+                                sender_value,
+                                &recipients,
+                                &paths,
+                            )
+                            .await
+                            {
+                                eprintln!(
+                                    "webhook notification failed for message from {:?}: {error}",
+                                    peer
+                                );
+                            }
                             write_response(&mut writer, "250 message accepted\r\n").await?;
                         }
                         Ok(DeliveryOutcome::IgnoredNoMatchingRecipient) => {
@@ -751,6 +828,100 @@ async fn persist_message(
         written_cleaned_paths.push(cleaned_final_path);
     }
     Ok(DeliveryOutcome::Stored(written_paths))
+}
+
+async fn notify_webhook(
+    config: &WebhookConfig,
+    sender: &str,
+    recipients: &[String],
+    paths: &[PathBuf],
+) -> io::Result<()> {
+    let Some(url) = &config.url else {
+        return Ok(());
+    };
+    let body = webhook_payload(sender, recipients, paths);
+    let timeout = Duration::from_secs(config.timeout_seconds.max(1));
+    tokio::time::timeout(
+        timeout,
+        send_webhook_request(url, config.bearer_token.as_deref(), &body),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "webhook request timed out"))??;
+    Ok(())
+}
+
+async fn send_webhook_request(
+    url: &WebhookUrl,
+    bearer_token: Option<&str>,
+    body: &str,
+) -> io::Result<()> {
+    let mut stream = TcpStream::connect((url.host.as_str(), url.port)).await?;
+    let mut request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        url.path,
+        url.host,
+        body.len()
+    );
+    if let Some(token) = bearer_token.filter(|token| !token.is_empty()) {
+        request.push_str("Authorization: Bearer ");
+        request.push_str(token);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response).await?;
+    let status_line_end = find_bytes(&response, b"\r\n")
+        .or_else(|| find_bytes(&response, b"\n"))
+        .unwrap_or(response.len());
+    let status_line = String::from_utf8_lossy(&response[..status_line_end]);
+    if status_line.contains(" 2") {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "webhook returned non-success status: {}",
+        status_line.trim()
+    )))
+}
+
+fn webhook_payload(sender: &str, recipients: &[String], paths: &[PathBuf]) -> String {
+    let recipients_json = recipients
+        .iter()
+        .map(|recipient| json_string(recipient))
+        .collect::<Vec<_>>()
+        .join(",");
+    let paths_json = paths
+        .iter()
+        .map(|path| json_string(&path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"event\":\"message_stored\",\"sender\":{},\"recipients\":[{}],\"stored_paths\":[{}]}}",
+        json_string(sender),
+        recipients_json,
+        paths_json
+    )
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch <= '\u{1f}' => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch if ch as u32 > 0x7f => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('\"');
+    out
 }
 
 async fn cleanup_written_files(paths: &[PathBuf], cleaned_paths: &[PathBuf]) {
@@ -1316,6 +1487,9 @@ mod tests {
             auth_results_trusted_servers = mx.google.com
             auth_results_required = dkim=pass, dmarc=pass
             auth_results_match = any
+            webhook_url = http://127.0.0.1:8080/new-mail
+            webhook_token = secret-token
+            webhook_timeout_seconds = 9
             "#,
         )
         .unwrap();
@@ -1342,6 +1516,16 @@ mod tests {
             vec!["dkim=pass", "dmarc=pass"]
         );
         assert_eq!(config.auth_results.match_mode, AuthResultsMatchMode::Any);
+        assert_eq!(
+            config.webhook.url,
+            Some(WebhookUrl {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+                path: "/new-mail".to_string(),
+            })
+        );
+        assert_eq!(config.webhook.bearer_token.as_deref(), Some("secret-token"));
+        assert_eq!(config.webhook.timeout_seconds, 9);
     }
 
     #[test]
@@ -1349,6 +1533,83 @@ mod tests {
         let error = parse_config_text("listen_addr 127.0.0.1:2525").unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn webhook_url_rejects_https_without_tls_client_dependency() {
+        let mut values = ConfigValues::new();
+        values.insert(
+            "SMTP_WEBHOOK_URL".to_string(),
+            "https://example.test/hook".to_string(),
+        );
+
+        let error = parse_webhook_config(&values).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn webhook_notification_posts_message_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                reader.read_until(b'\n', &mut line).await.unwrap();
+                if line == b"\r\n" || line == b"\n" || line.is_empty() {
+                    break;
+                }
+                request.extend_from_slice(&line);
+            }
+            let request_text = String::from_utf8(request).unwrap();
+            let content_length = request_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            (request_text, String::from_utf8(body).unwrap())
+        });
+        let config = WebhookConfig {
+            url: Some(WebhookUrl {
+                host: "127.0.0.1".to_string(),
+                port: addr.port(),
+                path: "/notify".to_string(),
+            }),
+            bearer_token: Some("notify-secret".to_string()),
+            timeout_seconds: 5,
+        };
+
+        notify_webhook(
+            &config,
+            "<sender@example.test>",
+            &["<udo@example.test>".to_string()],
+            &[PathBuf::from("/mail/inbox/udo/message.eml")],
+        )
+        .await
+        .unwrap();
+        let (request, body) = server.await.unwrap();
+
+        assert!(request.starts_with("POST /notify HTTP/1.1"));
+        assert!(request.contains("Authorization: Bearer notify-secret"));
+        assert!(body.contains("\"event\":\"message_stored\""));
+        assert!(body.contains("<udo@example.test>"));
+        assert!(body.contains("/mail/inbox/udo/message.eml"));
     }
 
     #[test]
@@ -1432,6 +1693,7 @@ mod tests {
             command_timeout_seconds: 300,
             recipient_domains: Vec::new(),
             auth_results: auth_results_off(),
+            webhook: webhook_off(),
         };
 
         let outcome = persist_message(
@@ -1775,6 +2037,15 @@ mod tests {
             command_timeout_seconds: 300,
             recipient_domains: Vec::new(),
             auth_results: auth_results_off(),
+            webhook: webhook_off(),
+        }
+    }
+
+    fn webhook_off() -> WebhookConfig {
+        WebhookConfig {
+            url: None,
+            bearer_token: None,
+            timeout_seconds: 5,
         }
     }
 

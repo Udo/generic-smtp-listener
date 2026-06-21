@@ -1854,8 +1854,9 @@ mod tests {
             &[
                 "<orders#protocol@undenheim.kautschuk.com>".to_string(),
                 "<udo+scanner@undenheim.kautschuk.com>".to_string(),
+                "<udo#protocol@undenheim.kautschuk.com>".to_string(),
             ],
-            b"To: orders#other@undenheim.kautschuk.com\r\n\r\nbody\r\n",
+            b"To: orders#other@undenheim.kautschuk.com\r\nCc: udo#other@undenheim.kautschuk.com\r\n\r\nbody\r\n",
         );
 
         assert_eq!(folders, vec!["orders", "udo"]);

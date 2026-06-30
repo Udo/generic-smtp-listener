@@ -390,10 +390,13 @@ fn parse_webhook_config(values: &ConfigValues) -> io::Result<WebhookConfig> {
         Some(value) if !value.trim().is_empty() => Some(parse_webhook_url(value.trim())?),
         _ => None,
     };
+    let bearer_token = config_optional(values, "SMTP_WEBHOOK_TOKEN")
+        .filter(|value| !value.trim().is_empty())
+        .map(validate_webhook_bearer_token)
+        .transpose()?;
     Ok(WebhookConfig {
         url,
-        bearer_token: config_optional(values, "SMTP_WEBHOOK_TOKEN")
-            .filter(|value| !value.trim().is_empty()),
+        bearer_token,
         timeout_seconds: parse_config_u64(values, "SMTP_WEBHOOK_TIMEOUT_SECONDS", 5)?,
     })
 }
@@ -415,6 +418,8 @@ fn parse_webhook_url(value: &str) -> io::Result<WebhookUrl> {
             "SMTP_WEBHOOK_URL host must not be empty",
         ));
     }
+    reject_http_request_field(authority, "SMTP_WEBHOOK_URL host")?;
+    reject_http_request_field(&path, "SMTP_WEBHOOK_URL path")?;
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() => {
             let port = port.parse::<u16>().map_err(|error| {
@@ -427,7 +432,33 @@ fn parse_webhook_url(value: &str) -> io::Result<WebhookUrl> {
         }
         _ => (authority.to_string(), 80),
     };
+    reject_http_request_field(&host, "SMTP_WEBHOOK_URL host")?;
     Ok(WebhookUrl { host, port, path })
+}
+
+fn validate_webhook_bearer_token(value: String) -> io::Result<String> {
+    if value.contains('\r') || value.contains('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SMTP_WEBHOOK_TOKEN must not contain CR or LF characters",
+        ));
+    }
+    Ok(value)
+}
+
+fn reject_http_request_field(value: &str, label: &str) -> io::Result<()> {
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{label} contains characters that are unsafe in an HTTP request line or header"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -1545,6 +1576,28 @@ mod tests {
 
         let error = parse_webhook_config(&values).unwrap_err();
 
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn webhook_config_rejects_http_request_injection_characters() {
+        let mut values = ConfigValues::new();
+        values.insert(
+            "SMTP_WEBHOOK_URL".to_string(),
+            "http://127.0.0.1:8080/new-mail HTTP/1.1".to_string(),
+        );
+        let error = parse_webhook_config(&values).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        values.insert(
+            "SMTP_WEBHOOK_URL".to_string(),
+            "http://127.0.0.1:8080/new-mail".to_string(),
+        );
+        values.insert(
+            "SMTP_WEBHOOK_TOKEN".to_string(),
+            "good-token\r\nX-Injected: yes".to_string(),
+        );
+        let error = parse_webhook_config(&values).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 

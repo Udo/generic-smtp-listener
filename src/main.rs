@@ -31,6 +31,7 @@ struct Config {
     max_connections: usize,
     command_timeout_seconds: u64,
     recipient_domains: Vec<String>,
+    discard_sender_domains: Vec<String>,
     auth_results: AuthResultsConfig,
     webhook: WebhookConfig,
 }
@@ -107,9 +108,13 @@ impl Config {
                 "SMTP_COMMAND_TIMEOUT_SECONDS",
                 300,
             )?,
-            recipient_domains: parse_recipient_domains(config_optional(
+            recipient_domains: parse_domain_list(config_optional(
                 &values,
                 "SMTP_RECIPIENT_DOMAINS",
+            )),
+            discard_sender_domains: parse_domain_list(config_optional(
+                &values,
+                "SMTP_DISCARD_SENDER_DOMAINS",
             )),
             auth_results: parse_auth_results_config(&values)?,
             webhook: parse_webhook_config(&values)?,
@@ -321,7 +326,7 @@ fn config_string(values: &ConfigValues, key: &str, default: &str) -> String {
     config_optional(values, key).unwrap_or_else(|| default.to_string())
 }
 
-fn parse_recipient_domains(value: Option<String>) -> Vec<String> {
+fn parse_domain_list(value: Option<String>) -> Vec<String> {
     value
         .unwrap_or_default()
         .split(',')
@@ -628,6 +633,10 @@ async fn handle_client(stream: TcpStream, state: Arc<AppState>) -> io::Result<()
                             );
                             write_response(&mut writer, "250 message accepted\r\n").await?;
                         }
+                        Ok(DeliveryOutcome::IgnoredDiscarded) => {
+                            eprintln!("ignored message from {:?}: sender discard policy", peer);
+                            write_response(&mut writer, "250 message accepted\r\n").await?;
+                        }
                         Ok(DeliveryOutcome::IgnoredAuthResults) => {
                             eprintln!(
                                 "ignored message from {:?}: authentication-results policy not satisfied",
@@ -776,6 +785,7 @@ enum DeliveryOutcome {
     Stored(Vec<PathBuf>),
     IgnoredNoMatchingRecipient,
     IgnoredAuthResults,
+    IgnoredDiscarded,
 }
 
 async fn persist_message(
@@ -799,6 +809,10 @@ async fn persist_message(
     }
     payload.extend_from_slice(b"\r\n");
     payload.extend_from_slice(data);
+
+    if message_sender_is_discarded(&config.discard_sender_domains, sender, data) {
+        return Ok(DeliveryOutcome::IgnoredDiscarded);
+    }
 
     if !message_satisfies_auth_results_policy(&config.auth_results, data) {
         return Ok(DeliveryOutcome::IgnoredAuthResults);
@@ -1034,6 +1048,40 @@ fn recipient_folders_for_message(
     }
 
     folders.into_iter().collect()
+}
+
+fn message_sender_is_discarded(
+    discard_domains: &[String],
+    envelope_sender: &str,
+    data: &[u8],
+) -> bool {
+    if discard_domains.is_empty() {
+        return false;
+    }
+    if sender_domain_matches(envelope_sender, discard_domains) {
+        return true;
+    }
+    let (header_bytes, _) = split_headers_body(data);
+    for (name, value) in parse_headers(header_bytes) {
+        if name.eq_ignore_ascii_case("from") && sender_domain_matches(&value, discard_domains) {
+            return true;
+        }
+    }
+    false
+}
+
+fn sender_domain_matches(text: &str, discard_domains: &[String]) -> bool {
+    for at_index in text.match_indices('@').map(|(index, _)| index) {
+        let domain_end = domain_end(text, at_index + 1);
+        if domain_end == at_index + 1 {
+            continue;
+        }
+        let domain = text[at_index + 1..domain_end].to_ascii_lowercase();
+        if discard_domains.iter().any(|wanted| wanted == &domain) {
+            return true;
+        }
+    }
+    false
 }
 
 fn collect_recipient_folders(
@@ -1514,6 +1562,7 @@ mod tests {
             max_connections = 4
             command_timeout_seconds = 5
             recipient_domains = kautschuk.com, @undenheim.kautschuk.com, kautschuk.com
+            discard_sender_domains = @No-Reply.COM, no-reply.com
             auth_results_mode = require
             auth_results_trusted_servers = mx.google.com
             auth_results_required = dkim=pass, dmarc=pass
@@ -1540,6 +1589,7 @@ mod tests {
             config.recipient_domains,
             vec!["kautschuk.com", "undenheim.kautschuk.com"]
         );
+        assert_eq!(config.discard_sender_domains, vec!["no-reply.com"]);
         assert_eq!(config.auth_results.mode, AuthResultsMode::Require);
         assert_eq!(config.auth_results.trusted_servers, vec!["mx.google.com"]);
         assert_eq!(
@@ -1745,6 +1795,7 @@ mod tests {
             max_connections: 100,
             command_timeout_seconds: 300,
             recipient_domains: Vec::new(),
+            discard_sender_domains: Vec::new(),
             auth_results: auth_results_off(),
             webhook: webhook_off(),
         };
@@ -1835,6 +1886,67 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::IgnoredNoMatchingRecipient);
         assert!(inbox_files(&config.inbox_dir).is_empty());
         assert!(inbox_files(&config.cleaned_inbox_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_message_discards_when_envelope_sender_domain_matches() {
+        let temp = TempDir::new().unwrap();
+        let mut config = test_config(temp.path(), 4096, 10, 10);
+        config.discard_sender_domains = vec!["no-reply.com".to_string()];
+
+        let outcome = persist_message(
+            &config,
+            "<alert@no-reply.com>",
+            &["<udo@example.test>".to_string()],
+            b"From: alert@example.test\r\nSubject: hi\r\n\r\nbody\r\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::IgnoredDiscarded);
+        assert!(inbox_files(&config.inbox_dir).is_empty());
+        assert!(inbox_files(&config.cleaned_inbox_dir).is_empty());
+        assert!(inbox_files(&config.temp_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_message_discards_when_from_header_domain_matches() {
+        let temp = TempDir::new().unwrap();
+        let mut config = test_config(temp.path(), 4096, 10, 10);
+        config.discard_sender_domains = vec!["no-reply.com".to_string()];
+
+        let outcome = persist_message(
+            &config,
+            "<forwarder@gmail.com>",
+            &["<udo@example.test>".to_string()],
+            b"From: GitHub <noreply@no-reply.com>\r\nSubject: hi\r\n\r\nbody\r\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::IgnoredDiscarded);
+        assert!(inbox_files(&config.inbox_dir).is_empty());
+        assert!(inbox_files(&config.cleaned_inbox_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_message_stores_when_discard_domains_do_not_match() {
+        let temp = TempDir::new().unwrap();
+        let mut config = test_config(temp.path(), 4096, 10, 10);
+        config.discard_sender_domains = vec!["no-reply.com".to_string()];
+
+        let outcome = persist_message(
+            &config,
+            "<sender@example.test>",
+            &["<rcpt@example.test>".to_string()],
+            b"From: sender@example.test\r\nSubject: hi\r\n\r\nbody\r\n",
+        )
+        .await
+        .unwrap();
+
+        let paths = stored_paths(outcome);
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].exists());
     }
 
     #[tokio::test]
@@ -2090,6 +2202,7 @@ mod tests {
             max_connections: 100,
             command_timeout_seconds: 300,
             recipient_domains: Vec::new(),
+            discard_sender_domains: Vec::new(),
             auth_results: auth_results_off(),
             webhook: webhook_off(),
         }

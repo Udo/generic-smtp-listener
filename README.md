@@ -13,6 +13,7 @@ This project is intentionally permissive: it accepts any sender and recipient an
 - Writes message data to a temporary directory first, then atomically renames the complete file into the inbox.
 - Also writes a cleaned copy into `SMTP_CLEANED_INBOX_DIR` for LLM ingestion.
 - When `SMTP_RECIPIENT_DOMAINS` is set, only messages addressed to those domains are stored, with one copy per matching local-part username folder.
+- When `SMTP_DISCARD_SENDER_DOMAINS` is set, messages whose envelope `MAIL FROM` or `From` header domain matches are accepted with `250` but never stored or webhook-notified, giving the sender no indication of the discard.
 - Can POST a local HTTP webhook after a message is stored, so an internal app can import or notify the recipient address.
 - Keeps temporary files outside both inboxes by default, so rsync jobs can read inboxes without seeing partial messages.
 - Prepends envelope metadata headers before the received DATA payload.
@@ -37,6 +38,7 @@ Environment variables with the same names are still supported and override file 
 | `SMTP_MAX_CONNECTIONS` | `100` | Maximum concurrent SMTP sessions. Set `0` to use Tokio's maximum semaphore permit count. |
 | `SMTP_COMMAND_TIMEOUT_SECONDS` | `300` | Idle timeout for SMTP commands and DATA reads. |
 | `SMTP_RECIPIENT_DOMAINS` | unset | Comma-separated recipient domains to route into username folders, for example `kautschuk.com,undenheim.kautschuk.com`. Matching uses envelope recipients plus `To`, `Cc`, and `Bcc` headers. If set and no recipient matches, the message is accepted but not stored. |
+| `SMTP_DISCARD_SENDER_DOMAINS` | unset | Comma-separated sender domains to silently discard, for example `no-reply.com`. Matching uses the envelope `MAIL FROM` domain plus the RFC5322 `From` header domain (case-insensitive, exact host match). Matching messages are accepted with `250` but never stored or webhook-notified, giving the sender no indication of the discard. |
 | `SMTP_AUTH_RESULTS_MODE` | `off` | Offline `Authentication-Results` gate. Use `require` to accept but not store messages unless a trusted `Authentication-Results` header satisfies the configured result requirements. This makes no DNS or network requests and is only as trustworthy as the configured upstream path. |
 | `SMTP_AUTH_RESULTS_TRUSTED_SERVERS` | unset | Comma-separated authserv-id values whose `Authentication-Results` headers may be trusted, for example `mx.google.com`. Required when `SMTP_AUTH_RESULTS_MODE=require`. |
 | `SMTP_AUTH_RESULTS_REQUIRED` | unset | Comma-separated lowercase result fragments to require inside a trusted header, for example `dkim=pass,dmarc=pass`. Required when `SMTP_AUTH_RESULTS_MODE=require`. |
